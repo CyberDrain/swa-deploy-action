@@ -1,0 +1,55 @@
+---
+# Deploying an artifact that was built elsewhere - a separate job, a release zip, or a
+# matrix fan-out across many Static Web Apps. No build step runs.
+name: Deploy prebuilt
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: Release zip to deploy
+        required: true
+        default: https://example.blob.core.windows.net/releases/latest.zip
+
+jobs:
+  deploy-artifact:
+    runs-on: ubuntu-latest
+    name: Deploy build artifact
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: ./site
+
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          app_location: "site"
+          skip_app_build: true
+
+  deploy-release-zip:
+    runs-on: ubuntu-latest
+    name: Deploy a release zip straight from its URL
+    steps:
+      # No checkout, no download step - zip_url streams the artifact and deploys the
+      # out/ folder from inside it
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          zip_url: ${{ inputs.release_url }}
+          zip_subdirectory: "out"
+
+  fan-out:
+    runs-on: ubuntu-latest
+    name: Same artifact to many apps
+    strategy:
+      fail-fast: false
+      matrix:
+        site: [contoso, fabrikam, northwind]
+    steps:
+      # Build once, deploy N times - each job pays no container build and no checkout
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets[format('SWA_TOKEN_{0}', matrix.site)] }}
+          zip_url: ${{ inputs.release_url }}
+          zip_subdirectory: "out"

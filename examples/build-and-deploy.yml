@@ -1,0 +1,48 @@
+---
+# Typical Node app: the action detects the package manager and builds with the runner's
+# toolchain. This is the closest equivalent to what Azure/static-web-apps-deploy does,
+# minus the 1.58 GB image pull.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+jobs:
+  deploy:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    name: Build and deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin the toolchain yourself - the action never installs runtimes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: CyberDrain/swa-deploy-action@v1
+        id: deploy
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: upload
+          app_location: "/"
+          output_location: "dist"
+          production_branch: "main"
+
+      - run: echo "Deployed to ${{ steps.deploy.outputs.static_web_app_url }}"
+
+  close_preview:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close preview environment
+    steps:
+      # Preview teardown is the one job this action does not implement
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: close

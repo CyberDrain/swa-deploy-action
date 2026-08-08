@@ -1,0 +1,21 @@
+# Build / test scratch
+node_modules/
+dist/
+out/
+*.zip
+
+# PowerShell
+*.psgetmodule
+testResults.xml
+psscriptanalyzer-results.txt
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local agent tooling - never ship this
+.claude/
+CLAUDE.md
+graphify/
+graphify-out/

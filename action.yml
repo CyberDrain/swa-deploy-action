@@ -1,0 +1,115 @@
+name: "Azure Static Web Apps Deploy"
+description: "Drop-in replacement for Azure/static-web-apps-deploy that starts instantly instead of building a container every run, builds with the runner's own toolchain, and reports the real reason a deployment failed"
+branding:
+  icon: "upload-cloud"
+  color: "green"
+
+inputs:
+  # ---- Azure/static-web-apps-deploy compatible inputs ----
+  azure_static_web_apps_api_token:
+    description: "Deployment token for the Static Web App"
+    required: true
+  action:
+    description: "Action to perform. Only 'upload' is supported."
+    required: false
+    default: "upload"
+  app_location:
+    description: "Directory location of the application source code"
+    required: false
+    default: "/"
+  output_location:
+    description: "Directory location of the compiled application code, relative to app_location"
+    required: false
+  app_artifact_location:
+    description: "Identical in use to output_location"
+    required: false
+  config_file_location:
+    description: "Directory location where staticwebapp.config.json can be found"
+    required: false
+  deployment_environment:
+    description: "Name of the Azure Static Web Apps environment to deploy to"
+    required: false
+  production_branch:
+    description: "When specified, deployments from other branches become preview environments"
+    required: false
+  app_build_command:
+    description: "Custom build command. Overrides package-manager detection."
+    required: false
+  skip_app_build:
+    description: "Skips the build step and deploys the content as-is"
+    required: false
+  skip_api_build:
+    description: "Accepted for compatibility. No API build is ever run."
+    required: false
+  is_static_export:
+    description: "Accepted for compatibility. Oryx-only hint, no effect here."
+    required: false
+  repo_token:
+    description: "Accepted for compatibility. Unused - this action does not comment on pull requests."
+    required: false
+  github_id_token:
+    description: "Accepted for compatibility. Unused."
+    required: false
+  api_build_command:
+    description: "Not supported - managed Azure Functions need the official action. Fails if set."
+    required: false
+  api_location:
+    description: "Not supported - managed Azure Functions need the official action. Fails if set."
+    required: false
+  data_api_location:
+    description: "Not supported - Data API needs the official action. Fails if set."
+    required: false
+  routes_location:
+    description: "Not supported - routes.json is deprecated. Fails if set."
+    required: false
+
+  # ---- additions ----
+  zip_url:
+    description: "Deploy a zip downloaded from this URL instead of app_location (e.g. a release artifact in blob storage). Implies skip_app_build."
+    required: false
+  zip_subdirectory:
+    description: "When deploying from a .zip, the subdirectory inside it to deploy (e.g. 'out')"
+    required: false
+  max_download_mb:
+    description: "Largest zip_url download to accept, in MB"
+    required: false
+    default: "1024"
+  verbose:
+    description: "Enable verbose request logging"
+    required: false
+    default: "false"
+
+outputs:
+  static_web_app_url:
+    description: "Url of the application"
+    value: ${{ steps.deploy.outputs.static_web_app_url }}
+
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: pwsh
+      env:
+        INPUT_AZURE_STATIC_WEB_APPS_API_TOKEN: ${{ inputs.azure_static_web_apps_api_token }}
+        INPUT_ACTION: ${{ inputs.action }}
+        INPUT_APP_LOCATION: ${{ inputs.app_location }}
+        INPUT_OUTPUT_LOCATION: ${{ inputs.output_location }}
+        INPUT_APP_ARTIFACT_LOCATION: ${{ inputs.app_artifact_location }}
+        INPUT_CONFIG_FILE_LOCATION: ${{ inputs.config_file_location }}
+        INPUT_DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
+        INPUT_PRODUCTION_BRANCH: ${{ inputs.production_branch }}
+        INPUT_SKIP_APP_BUILD: ${{ inputs.skip_app_build }}
+        INPUT_SKIP_API_BUILD: ${{ inputs.skip_api_build }}
+        INPUT_IS_STATIC_EXPORT: ${{ inputs.is_static_export }}
+        INPUT_REPO_TOKEN: ${{ inputs.repo_token }}
+        INPUT_GITHUB_ID_TOKEN: ${{ inputs.github_id_token }}
+        INPUT_APP_BUILD_COMMAND: ${{ inputs.app_build_command }}
+        INPUT_API_BUILD_COMMAND: ${{ inputs.api_build_command }}
+        INPUT_API_LOCATION: ${{ inputs.api_location }}
+        INPUT_DATA_API_LOCATION: ${{ inputs.data_api_location }}
+        INPUT_ROUTES_LOCATION: ${{ inputs.routes_location }}
+        INPUT_ZIP_URL: ${{ inputs.zip_url }}
+        INPUT_ZIP_SUBDIRECTORY: ${{ inputs.zip_subdirectory }}
+        INPUT_MAX_DOWNLOAD_MB: ${{ inputs.max_download_mb }}
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+      run: ${{ github.action_path }}/src/Invoke-Action.ps1
