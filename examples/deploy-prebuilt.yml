@@ -21,6 +21,7 @@ jobs:
           name: site
           path: ./site
 
+      # skip_app_build means no detection and no Node resolution - the artifact is final
       - uses: CyberDrain/swa-deploy-action@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}

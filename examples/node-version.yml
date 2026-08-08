@@ -1,0 +1,65 @@
+---
+# Controlling which Node builds the app.
+#
+# Oryx picks from runtimes baked into its image, so the choice goes stale as the image ages.
+# This action resolves engines.node against nodejs.org's live index instead, so a range keeps
+# selecting current releases with nothing to rebuild.
+name: Node version handling
+
+on:
+  workflow_dispatch:
+
+jobs:
+  automatic:
+    runs-on: ubuntu-latest
+    name: Let the action resolve it (recommended)
+    steps:
+      - uses: actions/checkout@v7
+
+      # package.json says {"engines": {"node": ">=22"}}.
+      # Runner satisfies it  -> nothing happens, zero cost.
+      # Runner does not      -> resolves >=22 to the newest 22.x/23.x/24.x published today,
+      #                         reuses the tool cache if possible, otherwise downloads and
+      #                         verifies the SHA256 before using it.
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          output_location: "dist"
+
+  with_setup_node:
+    runs-on: ubuntu-latest
+    name: Use setup-node for npm caching
+    steps:
+      - uses: actions/checkout@v7
+
+      # Worth adding when you want setup-node's dependency cache. The action finds whatever
+      # it installed in the tool cache and reuses it. Point it at the file that already
+      # declares the version rather than restating one here.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          output_location: "dist"
+
+  pinned_offline:
+    runs-on: ubuntu-latest
+    name: Never fetch a runtime
+    steps:
+      - uses: actions/checkout@v7
+
+      # install_node: false turns a version mismatch back into a warning. Use it on
+      # self-hosted runners with no egress to nodejs.org, or when the toolchain is
+      # provisioned elsewhere and must not change.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - uses: CyberDrain/swa-deploy-action@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          output_location: "dist"
+          install_node: false

@@ -20,8 +20,14 @@
         'Get-SwaPackageManager',
         'Invoke-SwaBuild',
         'Invoke-SwaExternalCommand',
-        'Test-SwaVersionRange',
-        'Get-SwaNodeVersionCheck'
+        'Get-SwaNodeVersionCheck',
+        'ConvertTo-SwaVersion',
+        'Compare-SwaVersion',
+        'Test-SwaVersionSatisfies',
+        'Get-SwaNodePlatform',
+        'Resolve-SwaNodeVersion',
+        'Install-SwaNode',
+        'Add-SwaPathEntry'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

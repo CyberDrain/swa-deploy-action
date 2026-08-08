@@ -100,7 +100,7 @@ Useful for fanning one release out across many Static Web Apps: build once, then
 
 ## Building
 
-Replicates what Oryx does for Node projects, using the runner's toolchain:
+Replicates what Oryx does for Node projects, using the runner's toolchain instead of bundled runtimes:
 
 | Detected | Install | Build |
 |---|---|---|
@@ -112,27 +112,44 @@ Replicates what Oryx does for Node projects, using the runner's toolchain:
 
 `build` runs only if `package.json` declares it. Commands run through the platform shell (`bash` on Linux/macOS, `pwsh` on Windows), so shell syntax works as written. Use `app_build_command` to override detection, or `skip_app_build: true` to deploy prebuilt output untouched.
 
-**Node version.** Oryx reads `engines.node` and switches to a runtime it bundles. Nothing is bundled here — the runner's Node does the building — so this action reads `engines.node` (falling back to `.nvmrc`) and *warns* when the runner's version doesn't satisfy it:
+### Node version: resolved live, not bundled
+
+Oryx reads `engines.node` and switches to a runtime **baked into its image**. That set is frozen when the image is published, which is why it drifts out of date — `>=22` gets you whatever 22.x happened to exist at image build time, and adding a newer release means rebuilding and republishing 1.58 GB.
+
+Nothing is bundled here. The range is resolved against **nodejs.org's live release index**, so it keeps picking up current releases with nothing to rebuild:
 
 ```
-::warning::Node 20.11.1 does not satisfy '>=22' from package.json engines.node.
-This action builds with the runner's Node - add a setup step before it:
-uses: actions/setup-node@v7 with: node-version-file: package.json
+Node 24.11.1 (project asks for '20.x' via package.json engines.node)
+Resolved '20.x' to Node 20.20.2 (LTS Iron)
+Installing Node 20.20.2 (darwin-arm64)...
+Building with Node 20.20.2
 ```
 
-It warns rather than fails, and stays quiet on ranges it can't parse.
+How it resolves, cheapest first:
 
-Most projects need no setup step at all — the runner's default Node is current. If yours does, don't restate the version in the workflow; point `setup-node` at the file that already declares it:
+1. **Runner's Node already satisfies the range** → nothing happens. This is the common case and costs zero.
+2. **Version is in the runner tool cache** (e.g. `setup-node` put it there) → reused, no download.
+3. **Otherwise** → download from nodejs.org, **verify SHA256 against the release's published `SHASUMS256.txt`**, extract, and prepend to `PATH` for this action and later steps.
+
+Range support covers what actually appears in `engines.node`: `>=`, `>`, `<=`, `<`, `^`, `~`, `=`, bare and X-ranges, space-separated AND, and `||` alternatives — compared on major, minor **and** patch, since the same range decides which runtime gets downloaded. A range it can't parse is left alone rather than guessed at.
+
+If the download fails it warns and builds with the runner's Node rather than failing the deploy. Set `install_node: false` to always warn instead of installing:
+
+```yaml
+- uses: CyberDrain/swa-deploy-action@v1
+  with:
+    azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+    output_location: "dist"
+    install_node: false     # warn on mismatch; don't fetch anything
+```
+
+You can still use `actions/setup-node` — this action will find and reuse whatever it installed. Just don't restate the version in the workflow; point it at the file that already declares it:
 
 ```yaml
 - uses: actions/setup-node@v7
   with:
     node-version-file: package.json   # reads engines.node (or use .nvmrc)
     cache: npm
-- uses: CyberDrain/swa-deploy-action@v1
-  with:
-    azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-    output_location: "dist"
 ```
 
 ## Input compatibility
@@ -155,7 +172,7 @@ Every input of the official action is accepted, so the swap is a one-line change
 
 Unsupported inputs fail loudly rather than being silently ignored, so a half-migrated workflow can't quietly deploy something wrong.
 
-**Additional inputs:** `zip_url`, `zip_subdirectory`, `max_download_mb`, `verbose`.
+**Additional inputs:** `install_node`, `zip_url`, `zip_subdirectory`, `max_download_mb`, `verbose`.
 
 **Output:** `static_web_app_url`.
 
@@ -212,6 +229,8 @@ Test-SwaQuota -Payload (New-SwaPayload -Path ./dist)
 | `Resolve-SwaWorkspacePath` | Resolve a path input, rejecting workspace escapes |
 | `Resolve-SwaContentHost` | Derive the content host from a deployment token |
 | `Get-SwaBuildPlan` / `Invoke-SwaBuild` | Detect and run the project build |
+| `Resolve-SwaNodeVersion` / `Install-SwaNode` | Resolve a range against nodejs.org and install it |
+| `Test-SwaVersionSatisfies` | npm-style semver range matching |
 | `ConvertTo-SwaErrorText` / `Get-SwaStatusError` | Flatten API error payloads |
 
 ## Development

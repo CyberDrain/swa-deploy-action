@@ -64,6 +64,7 @@ $appBuildCommand = Get-ActionInput 'app_build_command'
 $zipUrl = Get-ActionInput 'zip_url'
 $zipSubdirectory = Get-ActionInput 'zip_subdirectory'
 $maxDownloadMb = Get-ActionInput 'max_download_mb' '1024'
+$installNode = (Get-ActionInput 'install_node' 'true') -notin @('false', 'False', 'FALSE', '0', 'no')
 $verbose = Test-ActionFlag 'verbose'
 
 # ---- reject what we cannot honour, loudly ----
@@ -115,7 +116,7 @@ if ($zipUrl) {
         if ($plan.Platform -ne 'none') {
             Write-Host "::group::Build ($($plan.Platform))"
             try {
-                Invoke-SwaBuild -Path $appRoot -Plan $plan
+                Invoke-SwaBuild -Path $appRoot -Plan $plan -InstallNode $installNode
             } finally {
                 Write-Host '::endgroup::'
             }

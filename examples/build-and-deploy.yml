@@ -1,7 +1,6 @@
 ---
-# Typical Node app: the action detects the package manager and builds with the runner's
-# toolchain. This is the closest equivalent to what Azure/static-web-apps-deploy does,
-# minus the 1.58 GB image pull.
+# Typical Node app. The action detects the package manager, matches the Node version the
+# project asks for, and builds with the runner's toolchain - no container, no Oryx.
 name: Deploy
 
 on:
@@ -19,14 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Optional. The runner's Node builds the app; this action never installs runtimes,
-      # it only warns if the runner's version does not satisfy engines.node. Reading the
-      # version from package.json keeps it declared in one place.
-      - uses: actions/setup-node@v7
-        with:
-          node-version-file: package.json
-          cache: npm
-
+      # No setup-node needed. The action reads engines.node (or .nvmrc), and if the
+      # runner's Node does not satisfy it, resolves the range against nodejs.org and
+      # installs a matching release - so the version never goes stale.
       - uses: CyberDrain/swa-deploy-action@v1
         id: deploy
         with:

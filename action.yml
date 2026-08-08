@@ -64,6 +64,10 @@ inputs:
     required: false
 
   # ---- additions ----
+  install_node:
+    description: "When the runner's Node does not satisfy engines.node, resolve the range against nodejs.org and install a matching release. Set false to warn instead."
+    required: false
+    default: "true"
   zip_url:
     description: "http(s) URL of a zip to download and deploy instead of app_location. Skips checkout and build entirely."
     required: false
@@ -108,6 +112,7 @@ runs:
         INPUT_API_LOCATION: ${{ inputs.api_location }}
         INPUT_DATA_API_LOCATION: ${{ inputs.data_api_location }}
         INPUT_ROUTES_LOCATION: ${{ inputs.routes_location }}
+        INPUT_INSTALL_NODE: ${{ inputs.install_node }}
         INPUT_ZIP_URL: ${{ inputs.zip_url }}
         INPUT_ZIP_SUBDIRECTORY: ${{ inputs.zip_subdirectory }}
         INPUT_MAX_DOWNLOAD_MB: ${{ inputs.max_download_mb }}

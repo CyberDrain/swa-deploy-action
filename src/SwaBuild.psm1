@@ -119,50 +119,326 @@ function Get-SwaBuildPlan {
     return $plan
 }
 
-function Test-SwaVersionRange {
+function ConvertTo-SwaVersion {
     <#
     .SYNOPSIS
-        Checks an installed major version against a semver range, the way Oryx resolves engines.node.
+        Parses a possibly-partial version ('22', '22.11', 'v22.11.0') into a comparable object.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Version
+    )
+
+    $text = $Version.Trim().TrimStart('v', 'V')
+    if ($text -notmatch '^(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?') { return $null }
+
+    $toInt = {
+        param($value)
+        if ($null -eq $value -or $value -eq '' -or $value -in @('x', 'X', '*')) { return $null }
+        return [int]$value
+    }
+
+    return [pscustomobject]@{
+        Major = [int]$Matches[1]
+        Minor = & $toInt $Matches[2]
+        Patch = & $toInt $Matches[3]
+    }
+}
+
+function Compare-SwaVersion {
+    <#
+    .SYNOPSIS
+        Compares two full versions. Returns -1, 0 or 1.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right
+    )
+
+    foreach ($part in @('Major', 'Minor', 'Patch')) {
+        $l = if ($null -ne $Left.$part) { $Left.$part } else { 0 }
+        $r = if ($null -ne $Right.$part) { $Right.$part } else { 0 }
+        if ($l -lt $r) { return -1 }
+        if ($l -gt $r) { return 1 }
+    }
+    return 0
+}
+
+function Test-SwaVersionSatisfies {
+    <#
+    .SYNOPSIS
+        Tests a concrete version against an npm-style range.
     .DESCRIPTION
-        Deliberately compares major versions only. Oryx picks a bundled runtime by major, and a
-        full semver implementation would be a lot of surface for a check whose only job is to
-        warn. Unparseable ranges return null so the caller reports both versions without judging.
+        Supports the comparators that actually appear in engines.node: >=, >, <=, <, ^, ~, =,
+        bare versions, X-ranges, space-separated AND, and '||' alternatives. Precision matters
+        here because the same range decides which runtime gets downloaded, not just whether to
+        warn. Ranges it cannot parse return null so callers can decline to act.
+    .EXAMPLE
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '>=20 <23'
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [Parameter(Mandatory)][string]$Range,
-        [Parameter(Mandatory)][int]$InstalledMajor
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$Range
     )
 
-    $range = $Range.Trim()
-    if (-not $range -or $range -in @('*', 'x', 'latest')) { return $true }
+    $actual = ConvertTo-SwaVersion -Version $Version
+    if (-not $actual) { return $null }
 
-    # '||' separates alternatives; any satisfied alternative satisfies the range
+    $range = $Range.Trim()
+    if (-not $range -or $range -in @('*', 'x', 'X', 'latest')) { return $true }
+
     foreach ($alternative in $range -split '\|\|') {
-        $comparators = $alternative.Trim() -split '\s+' | Where-Object { $_ }
-        if (-not $comparators) { continue }
+        $comparators = @($alternative.Trim() -split '\s+' | Where-Object { $_ })
+        if ($comparators.Count -eq 0) { continue }
 
         $allMatch = $true
         foreach ($comparator in $comparators) {
-            if ($comparator -notmatch '^(>=|<=|>|<|\^|~|=)?\s*v?(\d+)') {
-                return $null   # something we don't understand - let the caller decide
-            }
+            if ($comparator -notmatch '^(>=|<=|>|<|\^|~|=)?\s*(v?[\dxX*][^\s]*)$') { return $null }
             $operator = $Matches[1]
-            $major = [int]$Matches[2]
+            $bound = ConvertTo-SwaVersion -Version $Matches[2]
+            if (-not $bound) { return $null }
+
+            # Lower bound is the partial version with missing parts zeroed
+            $lower = [pscustomobject]@{
+                Major = $bound.Major
+                Minor = $(if ($null -ne $bound.Minor) { $bound.Minor } else { 0 })
+                Patch = $(if ($null -ne $bound.Patch) { $bound.Patch } else { 0 })
+            }
+
+            # Upper bound for the range operators: the first version that is too new
+            $upper = $null
+            switch ($operator) {
+                '^' {
+                    # ^0.2.3 pins the minor; ^1.2.3 pins the major
+                    $upper = if ($bound.Major -eq 0 -and $null -ne $bound.Minor) {
+                        [pscustomobject]@{ Major = 0; Minor = $bound.Minor + 1; Patch = 0 }
+                    } else {
+                        [pscustomobject]@{ Major = $bound.Major + 1; Minor = 0; Patch = 0 }
+                    }
+                }
+                '~' {
+                    $upper = if ($null -ne $bound.Minor) {
+                        [pscustomobject]@{ Major = $bound.Major; Minor = $bound.Minor + 1; Patch = 0 }
+                    } else {
+                        [pscustomobject]@{ Major = $bound.Major + 1; Minor = 0; Patch = 0 }
+                    }
+                }
+                default {
+                    # A partial bare/= version is an X-range: '22' means >=22.0.0 <23.0.0
+                    if ($operator -in @($null, '', '=') -and $null -eq $bound.Patch) {
+                        $upper = if ($null -ne $bound.Minor) {
+                            [pscustomobject]@{ Major = $bound.Major; Minor = $bound.Minor + 1; Patch = 0 }
+                        } else {
+                            [pscustomobject]@{ Major = $bound.Major + 1; Minor = 0; Patch = 0 }
+                        }
+                    }
+                }
+            }
 
             $satisfied = switch ($operator) {
-                '>=' { $InstalledMajor -ge $major }
-                '>' { $InstalledMajor -gt $major }
-                '<=' { $InstalledMajor -le $major }
-                '<' { $InstalledMajor -lt $major }
-                default { $InstalledMajor -eq $major }   # ^, ~, =, bare, and X.x all pin the major
+                '>=' { (Compare-SwaVersion $actual $lower) -ge 0 }
+                '>' { (Compare-SwaVersion $actual $lower) -gt 0 }
+                '<=' { (Compare-SwaVersion $actual $lower) -le 0 }
+                '<' { (Compare-SwaVersion $actual $lower) -lt 0 }
+                default {
+                    if ($upper) {
+                        (Compare-SwaVersion $actual $lower) -ge 0 -and (Compare-SwaVersion $actual $upper) -lt 0
+                    } else {
+                        (Compare-SwaVersion $actual $lower) -eq 0
+                    }
+                }
             }
+
             if (-not $satisfied) { $allMatch = $false; break }
         }
         if ($allMatch) { return $true }
     }
     return $false
+}
+
+function Get-SwaNodePlatform {
+    <#
+    .SYNOPSIS
+        Maps the current OS and architecture onto nodejs.org's distribution naming.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+        'X64' { 'x64' }
+        'Arm64' { 'arm64' }
+        'X86' { 'x86' }
+        default { throw "Unsupported processor architecture for a Node download: $_" }
+    }
+
+    if ($IsWindows) {
+        return [pscustomobject]@{ Slug = "win-$arch"; Arch = $arch; Extension = 'zip'; BinSubPath = ''; Executable = 'node.exe' }
+    }
+    if ($IsMacOS) {
+        return [pscustomobject]@{ Slug = "darwin-$arch"; Arch = $arch; Extension = 'tar.gz'; BinSubPath = 'bin'; Executable = 'node' }
+    }
+    return [pscustomobject]@{ Slug = "linux-$arch"; Arch = $arch; Extension = 'tar.gz'; BinSubPath = 'bin'; Executable = 'node' }
+}
+
+function Resolve-SwaNodeVersion {
+    <#
+    .SYNOPSIS
+        Picks the newest Node release satisfying a range, from nodejs.org's live index.
+    .DESCRIPTION
+        This is the part Oryx cannot do. Its runtimes are baked into the image, so the set
+        goes stale the moment the image is published and '>=22' resolves to whatever happened
+        to be current at build time. Resolving against the published index means a range
+        always picks up the newest matching release without anything being rebuilt.
+    .EXAMPLE
+        Resolve-SwaNodeVersion -Range '>=22'
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$Range,
+
+        # Pre-fetched index (list of {version, lts, ...}); fetched when omitted
+        $Index,
+
+        [string]$IndexUrl = 'https://nodejs.org/dist/index.json',
+        [int]$TimeoutSeconds = 60
+    )
+
+    if (-not $Index) {
+        Write-Verbose "[SWA] Fetching Node release index from $IndexUrl"
+        $Index = Invoke-RestMethod -Uri $IndexUrl -Method Get -TimeoutSec $TimeoutSeconds
+    }
+
+    $best = $null
+    foreach ($entry in $Index) {
+        if (-not $entry.version) { continue }
+        if ((Test-SwaVersionSatisfies -Version $entry.version -Range $Range) -ne $true) { continue }
+
+        $parsed = ConvertTo-SwaVersion -Version $entry.version
+        if (-not $parsed) { continue }
+        if (-not $best -or (Compare-SwaVersion -Left $parsed -Right $best.Parsed) -gt 0) {
+            # lts is either false or the codename string
+            $lts = if ($entry.lts -is [string]) { $entry.lts } else { $null }
+            $best = [pscustomobject]@{
+                Version = "$($entry.version)".TrimStart('v')
+                Parsed  = $parsed
+                Lts     = $lts
+            }
+        }
+    }
+
+    return $best
+}
+
+function Install-SwaNode {
+    <#
+    .SYNOPSIS
+        Makes a specific Node version available on PATH, reusing the tool cache when possible.
+    .DESCRIPTION
+        Checks the runner's tool cache first, so a version setup-node already installed costs
+        nothing. Otherwise downloads from nodejs.org, verifies the SHA256 against the release's
+        published SHASUMS256.txt, extracts, and prepends to PATH for this process and for
+        later workflow steps via GITHUB_PATH.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$Version,
+        [string]$InstallRoot,
+        [string]$DistBaseUrl = 'https://nodejs.org/dist'
+    )
+
+    $version = $Version.TrimStart('v')
+    $platform = Get-SwaNodePlatform
+
+    # 1. Reuse whatever the runner already has
+    if ($env:RUNNER_TOOL_CACHE) {
+        $cached = Join-Path $env:RUNNER_TOOL_CACHE (Join-Path 'node' (Join-Path $version $platform.Arch))
+        $cachedBin = if ($platform.BinSubPath) { Join-Path $cached $platform.BinSubPath } else { $cached }
+        if (Test-Path -LiteralPath (Join-Path $cachedBin $platform.Executable)) {
+            Write-Host "Node $version already in the runner tool cache."
+            Add-SwaPathEntry -Path $cachedBin
+            return $cachedBin
+        }
+    }
+
+    if (-not $InstallRoot) { $InstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'swa-node' }
+    $extractRoot = Join-Path $InstallRoot $version
+    $folderName = "node-v$version-$($platform.Slug)"
+    $installed = Join-Path $extractRoot $folderName
+    $installedBin = if ($platform.BinSubPath) { Join-Path $installed $platform.BinSubPath } else { $installed }
+
+    # 2. Already downloaded earlier in this job
+    if (Test-Path -LiteralPath (Join-Path $installedBin $platform.Executable)) {
+        Add-SwaPathEntry -Path $installedBin
+        return $installedBin
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("Node $version", 'Download and install')) { return $null }
+
+    $fileName = "$folderName.$($platform.Extension)"
+    $downloadUrl = "$DistBaseUrl/v$version/$fileName"
+    $null = New-Item -ItemType Directory -Path $extractRoot -Force
+    $archivePath = Join-Path $extractRoot $fileName
+
+    Write-Host "Installing Node $version ($($platform.Slug))..."
+    Write-Verbose "[SWA] Downloading $downloadUrl"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec 300
+
+    # 3. Verify against the release's published checksums before trusting the archive
+    try {
+        $sums = Invoke-RestMethod -Uri "$DistBaseUrl/v$version/SHASUMS256.txt" -Method Get -TimeoutSec 60
+        $expected = ($sums -split "`n" | Where-Object { $_ -match "\s\*?$([regex]::Escape($fileName))\s*$" } |
+                Select-Object -First 1) -split '\s+' | Select-Object -First 1
+        if (-not $expected) { throw "no checksum published for $fileName" }
+
+        $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+        if ($actual -ne $expected.ToUpperInvariant()) {
+            throw "SHA256 mismatch for ${fileName}: expected $expected, got $actual"
+        }
+        Write-Verbose '[SWA] Checksum verified'
+    } catch {
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+        throw "Could not verify the Node $version download: $($_.Exception.Message)"
+    }
+
+    # 4. Extract
+    if ($platform.Extension -eq 'zip') {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $extractRoot)
+    } else {
+        & tar -xzf $archivePath -C $extractRoot
+        if ($LASTEXITCODE -ne 0) { throw "Extracting $fileName failed with exit code $LASTEXITCODE." }
+    }
+    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+
+    if (-not (Test-Path -LiteralPath (Join-Path $installedBin $platform.Executable))) {
+        throw "Node $version did not extract to the expected layout ($installedBin)."
+    }
+
+    Add-SwaPathEntry -Path $installedBin
+    return $installedBin
+}
+
+function Add-SwaPathEntry {
+    <#
+    .SYNOPSIS
+        Prepends a directory to PATH for this process and for later workflow steps.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Prepend to PATH')) { return }
+
+    $env:PATH = "$Path$([System.IO.Path]::PathSeparator)$env:PATH"
+    if ($env:GITHUB_PATH) { $Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
 }
 
 function Get-SwaNodeVersionCheck {
@@ -223,9 +499,8 @@ function Get-SwaNodeVersionCheck {
     if (-not $installedRaw) { return $result }
 
     $result.Installed = "$installedRaw".Trim().TrimStart('v')
-    $installedMajor = [int](($result.Installed -split '\.')[0])
 
-    $satisfied = Test-SwaVersionRange -Range $result.Requested -InstalledMajor $installedMajor
+    $satisfied = Test-SwaVersionSatisfies -Version $result.Installed -Range $result.Requested
     # A null verdict means the range was unparseable - don't cry wolf
     $result.Satisfied = ($null -eq $satisfied) -or $satisfied
     return $result
@@ -268,7 +543,10 @@ function Invoke-SwaBuild {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)]$Plan
+        [Parameter(Mandatory)]$Plan,
+
+        # Install a matching Node when the runner's version doesn't satisfy engines.node
+        [bool]$InstallNode = $true
     )
 
     if ($Plan.Platform -eq 'none') {
@@ -286,18 +564,36 @@ function Invoke-SwaBuild {
         }
     }
 
-    # Oryx would switch runtimes to match; the runner's Node is fixed, so say so plainly
+    # Match the runtime the project asks for. Unlike Oryx the candidate set is nodejs.org's
+    # live index, so a range keeps resolving to current releases with nothing to rebuild.
     $node = $Plan.NodeVersion
     if ($node -and $node.Requested) {
         if ($node.Installed) {
             Write-Host "Node $($node.Installed) (project asks for '$($node.Requested)' via $($node.Source))"
         }
         if (-not $node.Satisfied) {
-            # Point at the file the version came from rather than a literal, so it stays
-            # declared in one place
-            Write-Host ("::warning::Node $($node.Installed) does not satisfy '$($node.Requested)' from " +
-                "$($node.Source). This action builds with the runner's Node - add a setup step before it: " +
-                "uses: actions/setup-node@v7 with: node-version-file: $($node.VersionFile)")
+            if (-not $InstallNode) {
+                Write-Host ("::warning::Node $($node.Installed) does not satisfy '$($node.Requested)' from " +
+                    "$($node.Source), and install_node is off. Add a setup step before this action: " +
+                    "uses: actions/setup-node@v7 with: node-version-file: $($node.VersionFile)")
+            } else {
+                try {
+                    $resolved = Resolve-SwaNodeVersion -Range $node.Requested
+                    if (-not $resolved) { throw "no published release satisfies '$($node.Requested)'" }
+
+                    $ltsNote = if ($resolved.Lts) { " (LTS $($resolved.Lts))" } else { '' }
+                    Write-Host "Resolved '$($node.Requested)' to Node $($resolved.Version)$ltsNote"
+                    $null = Install-SwaNode -Version $resolved.Version
+
+                    $now = "$(& node --version 2>$null)".Trim().TrimStart('v')
+                    if ($now) { Write-Host "Building with Node $now" }
+                } catch {
+                    # A build on the wrong major usually still works; failing the deploy over a
+                    # download hiccup would be worse than saying so and carrying on
+                    Write-Host ("::warning::Could not install a Node matching '$($node.Requested)': " +
+                        "$($_.Exception.Message). Building with Node $($node.Installed) instead.")
+                }
+            }
         }
     }
 
@@ -310,4 +606,6 @@ function Invoke-SwaBuild {
 }
 
 Export-ModuleMember -Function Get-SwaBuildPlan, Get-SwaPackageManager, Invoke-SwaBuild,
-Invoke-SwaExternalCommand, Test-SwaVersionRange, Get-SwaNodeVersionCheck
+Invoke-SwaExternalCommand, Get-SwaNodeVersionCheck, ConvertTo-SwaVersion, Compare-SwaVersion,
+Test-SwaVersionSatisfies, Get-SwaNodePlatform, Resolve-SwaNodeVersion, Install-SwaNode,
+Add-SwaPathEntry

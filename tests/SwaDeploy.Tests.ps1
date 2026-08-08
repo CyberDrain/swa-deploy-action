@@ -288,40 +288,108 @@ Describe 'Copy-SwaZipSubdirectory zip-bomb guard' {
     }
 }
 
-Describe 'Test-SwaVersionRange' {
+Describe 'Test-SwaVersionSatisfies' {
     It 'accepts wildcards' {
-        Test-SwaVersionRange -Range '*' -InstalledMajor 20 | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '*' | Should -BeTrue
     }
 
-    It 'pins the major for caret, tilde, x and bare ranges' -ForEach @(
-        @{ Range = '^20.1.0' }, @{ Range = '~20.1.0' }, @{ Range = '20.x' }, @{ Range = '20' }, @{ Range = '=20.0.0' }
-    ) {
-        Test-SwaVersionRange -Range $Range -InstalledMajor 20 | Should -BeTrue
-        Test-SwaVersionRange -Range $Range -InstalledMajor 18 | Should -BeFalse
+    It 'treats a bare major as an X-range' {
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '22' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '23.0.0' -Range '22' | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '21.9.9' -Range '22' | Should -BeFalse
     }
 
-    It 'handles >= and >' {
-        Test-SwaVersionRange -Range '>=18' -InstalledMajor 22 | Should -BeTrue
-        Test-SwaVersionRange -Range '>=18' -InstalledMajor 16 | Should -BeFalse
-        Test-SwaVersionRange -Range '>18' -InstalledMajor 18 | Should -BeFalse
+    It 'honours minor precision in an X-range' {
+        Test-SwaVersionSatisfies -Version '22.11.5' -Range '22.11' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '22.12.0' -Range '22.11' | Should -BeFalse
+    }
+
+    It 'matches caret ranges on the minor and patch, not just the major' {
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '^22.10.0' | Should -BeTrue
+        # The major-only comparison this replaced wrongly accepted this
+        Test-SwaVersionSatisfies -Version '22.9.0' -Range '^22.10.0' | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '23.0.0' -Range '^22.10.0' | Should -BeFalse
+    }
+
+    It 'pins the minor for caret ranges on 0.x' {
+        Test-SwaVersionSatisfies -Version '0.2.9' -Range '^0.2.3' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '0.3.0' -Range '^0.2.3' | Should -BeFalse
+    }
+
+    It 'matches tilde ranges on the minor' {
+        Test-SwaVersionSatisfies -Version '22.11.9' -Range '~22.11.0' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '22.12.0' -Range '~22.11.0' | Should -BeFalse
+    }
+
+    It 'handles comparison operators' {
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '>=20' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '18.0.0' -Range '>=20' | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '20.0.0' -Range '>20' | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '18.1.0' -Range '<20' | Should -BeTrue
     }
 
     It 'ANDs space-separated comparators' {
-        Test-SwaVersionRange -Range '>=18 <21' -InstalledMajor 20 | Should -BeTrue
-        Test-SwaVersionRange -Range '>=18 <21' -InstalledMajor 22 | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '20.1.0' -Range '>=18 <21' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '22.0.0' -Range '>=18 <21' | Should -BeFalse
     }
 
     It 'ORs alternatives separated by ||' {
-        Test-SwaVersionRange -Range '18.x || 20.x' -InstalledMajor 20 | Should -BeTrue
-        Test-SwaVersionRange -Range '18.x || 20.x' -InstalledMajor 19 | Should -BeFalse
+        Test-SwaVersionSatisfies -Version '20.1.0' -Range '18.x || 20.x' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '19.1.0' -Range '18.x || 20.x' | Should -BeFalse
     }
 
-    It 'strips a leading v' {
-        Test-SwaVersionRange -Range 'v20' -InstalledMajor 20 | Should -BeTrue
+    It 'matches an exact pin exactly' {
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range '22.11.0' | Should -BeTrue
+        Test-SwaVersionSatisfies -Version '22.11.1' -Range '22.11.0' | Should -BeFalse
+    }
+
+    It 'strips a leading v on either side' {
+        Test-SwaVersionSatisfies -Version 'v22.11.0' -Range 'v22' | Should -BeTrue
     }
 
     It 'returns null for a range it cannot parse, rather than guessing' {
-        Test-SwaVersionRange -Range 'lts/hydrogen' -InstalledMajor 20 | Should -BeNullOrEmpty
+        Test-SwaVersionSatisfies -Version '22.11.0' -Range 'lts/hydrogen' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Resolve-SwaNodeVersion' {
+    BeforeAll {
+        # A stand-in for nodejs.org/dist/index.json so the test needs no network
+        $script:index = @(
+            [pscustomobject]@{ version = 'v23.5.0'; lts = $false }
+            [pscustomobject]@{ version = 'v22.12.0'; lts = 'Jod' }
+            [pscustomobject]@{ version = 'v22.11.0'; lts = 'Jod' }
+            [pscustomobject]@{ version = 'v20.18.1'; lts = 'Iron' }
+            [pscustomobject]@{ version = 'v18.20.5'; lts = 'Hydrogen' }
+        )
+    }
+
+    It 'picks the newest release satisfying the range' {
+        (Resolve-SwaNodeVersion -Range '>=20' -Index $script:index).Version | Should -Be '23.5.0'
+    }
+
+    It 'stays inside an X-range' {
+        (Resolve-SwaNodeVersion -Range '22.x' -Index $script:index).Version | Should -Be '22.12.0'
+    }
+
+    It 'respects an upper bound' {
+        (Resolve-SwaNodeVersion -Range '>=18 <22' -Index $script:index).Version | Should -Be '20.18.1'
+    }
+
+    It 'reports the LTS codename when there is one' {
+        (Resolve-SwaNodeVersion -Range '20.x' -Index $script:index).Lts | Should -Be 'Iron'
+    }
+
+    It 'returns nothing when no release matches' {
+        Resolve-SwaNodeVersion -Range '>=99' -Index $script:index | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-SwaNodePlatform' {
+    It 'maps this machine onto a nodejs.org distribution slug' {
+        $platform = Get-SwaNodePlatform
+        $platform.Slug | Should -Match '^(linux|darwin|win)-(x64|arm64|x86)$'
+        $platform.Extension | Should -BeIn @('tar.gz', 'zip')
     }
 }
 
