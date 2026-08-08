@@ -181,10 +181,12 @@ function Get-SwaNodeVersionCheck {
     )
 
     $result = [pscustomobject]@{
-        Requested = $null
-        Installed = $null
-        Satisfied = $true
-        Source    = $null
+        Requested   = $null
+        Installed   = $null
+        Satisfied   = $true
+        Source      = $null
+        # File to hand to setup-node's node-version-file, so the version stays declared once
+        VersionFile = $null
     }
 
     $packageJsonPath = Join-Path $Path 'package.json'
@@ -195,6 +197,7 @@ function Get-SwaNodeVersionCheck {
                 $packageJson.engines.PSObject.Properties.Name -contains 'node') {
                 $result.Requested = "$($packageJson.engines.node)".Trim()
                 $result.Source = 'package.json engines.node'
+                $result.VersionFile = 'package.json'
             }
         } catch {
             Write-Verbose "[SWA] Could not read engines.node: $($_.Exception.Message)"
@@ -207,6 +210,7 @@ function Get-SwaNodeVersionCheck {
         if (Test-Path -LiteralPath $nvmrcPath) {
             $result.Requested = (Get-Content -LiteralPath $nvmrcPath -Raw).Trim()
             $result.Source = '.nvmrc'
+            $result.VersionFile = '.nvmrc'
         }
     }
 
@@ -289,10 +293,11 @@ function Invoke-SwaBuild {
             Write-Host "Node $($node.Installed) (project asks for '$($node.Requested)' via $($node.Source))"
         }
         if (-not $node.Satisfied) {
-            $major = if ($node.Requested -match '(\d+)') { $Matches[1] } else { $node.Requested }
+            # Point at the file the version came from rather than a literal, so it stays
+            # declared in one place
             Write-Host ("::warning::Node $($node.Installed) does not satisfy '$($node.Requested)' from " +
                 "$($node.Source). This action builds with the runner's Node - add a setup step before it: " +
-                "uses: actions/setup-node@v4 with: node-version: $major")
+                "uses: actions/setup-node@v7 with: node-version-file: $($node.VersionFile)")
         }
     }
 

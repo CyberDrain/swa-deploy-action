@@ -325,6 +325,8 @@ Describe 'Get-SwaNodeVersionCheck' {
         $check = Get-SwaNodeVersionCheck -Path $script:projectDir
         $check.Requested | Should -Be '>=20'
         $check.Source | Should -Be 'package.json engines.node'
+        # Named so the warning can suggest node-version-file instead of a literal version
+        $check.VersionFile | Should -Be 'package.json'
     }
 
     It 'prefers engines.node over .nvmrc' {
@@ -339,6 +341,7 @@ Describe 'Get-SwaNodeVersionCheck' {
         $check = Get-SwaNodeVersionCheck -Path $script:projectDir
         $check.Requested | Should -Be '18'
         $check.Source | Should -Be '.nvmrc'
+        $check.VersionFile | Should -Be '.nvmrc'
     }
 
     It 'flags a mismatch against the installed runtime' {

@@ -19,10 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pin the toolchain yourself - the action never installs runtimes
+      # Optional. The runner's Node builds the app; this action never installs runtimes,
+      # it only warns if the runner's version does not satisfy engines.node. Reading the
+      # version from package.json keeps it declared in one place.
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version-file: package.json
           cache: npm
 
       - uses: CyberDrain/swa-deploy-action@v1

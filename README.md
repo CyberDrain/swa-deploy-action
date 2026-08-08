@@ -104,20 +104,22 @@ Replicates what Oryx does for Node projects, using the runner's toolchain:
 
 `build` runs only if `package.json` declares it. Commands run through the platform shell (`bash` on Linux/macOS, `pwsh` on Windows), so shell syntax works as written. Use `app_build_command` to override detection, or `skip_app_build: true` to deploy prebuilt output untouched.
 
-**Node version.** Oryx reads `engines.node` and switches to a runtime it bundles. Nothing is bundled here, so this action reads `engines.node` (falling back to `.nvmrc`) and *warns* when the runner's Node doesn't satisfy it:
+**Node version.** Oryx reads `engines.node` and switches to a runtime it bundles. Nothing is bundled here — the runner's Node does the building — so this action reads `engines.node` (falling back to `.nvmrc`) and *warns* when the runner's version doesn't satisfy it:
 
 ```
 ::warning::Node 20.11.1 does not satisfy '>=22' from package.json engines.node.
 This action builds with the runner's Node - add a setup step before it:
-uses: actions/setup-node@v7 with: node-version: 22
+uses: actions/setup-node@v7 with: node-version-file: package.json
 ```
 
-It warns rather than fails, and stays quiet on ranges it can't parse. Pin the toolchain the normal way:
+It warns rather than fails, and stays quiet on ranges it can't parse.
+
+Most projects need no setup step at all — the runner's default Node is current. If yours does, don't restate the version in the workflow; point `setup-node` at the file that already declares it:
 
 ```yaml
 - uses: actions/setup-node@v7
   with:
-    node-version: 22
+    node-version-file: package.json   # reads engines.node (or use .nvmrc)
     cache: npm
 - uses: CyberDrain/swa-deploy-action@v1
   with:
