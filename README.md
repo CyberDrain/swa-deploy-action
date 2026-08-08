@@ -109,13 +109,13 @@ Replicates what Oryx does for Node projects, using the runner's toolchain:
 ```
 ::warning::Node 20.11.1 does not satisfy '>=22' from package.json engines.node.
 This action builds with the runner's Node - add a setup step before it:
-uses: actions/setup-node@v4 with: node-version: 22
+uses: actions/setup-node@v7 with: node-version: 22
 ```
 
 It warns rather than fails, and stays quiet on ranges it can't parse. Pin the toolchain the normal way:
 
 ```yaml
-- uses: actions/setup-node@v4
+- uses: actions/setup-node@v7
   with:
     node-version: 22
     cache: npm
