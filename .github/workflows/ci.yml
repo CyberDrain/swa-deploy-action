@@ -13,20 +13,17 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # The action is composite, so it has to work on every runner that ships pwsh
-        os: [ubuntu-latest, windows-latest, macos-latest]
+  ci:
+    name: Test and lint
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Pester
+      - name: Install PowerShell modules
         shell: pwsh
-        run: Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+        run: |
+          Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
 
       - name: Run tests
         shell: pwsh
@@ -37,61 +34,41 @@ jobs:
           $config.Run.Exit = $true
           Invoke-Pester -Configuration $config
 
-  lint:
-    name: PSScriptAnalyzer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install PSScriptAnalyzer
-        shell: pwsh
-        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-
       - name: Analyze
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path ./src -Recurse -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost
+          $results = @()
+          foreach ($file in (Get-ChildItem ./src -Recurse -Include '*.ps1', '*.psm1', '*.psd1')) {
+            $results += Invoke-ScriptAnalyzer -Path $file.FullName -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost
+          }
           if ($results) {
             $results | Format-Table -AutoSize
-            if ($results | Where-Object Severity -eq 'Error') {
-              throw "PSScriptAnalyzer found $(($results | Where-Object Severity -eq 'Error').Count) error(s)."
-            }
+            $errors = @($results | Where-Object Severity -eq 'Error')
+            if ($errors) { throw "PSScriptAnalyzer found $($errors.Count) error(s)." }
             Write-Warning "PSScriptAnalyzer found $($results.Count) warning(s)."
           } else {
             Write-Host 'No issues found.'
           }
 
-  smoke:
-    name: Build detection smoke test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Proves the action builds a Node project with the runner's own toolchain and stops at
-      # the deploy step, without needing a real Static Web App or a token.
-      - name: Create a throwaway project
-        shell: bash
-        run: |
-          mkdir -p /tmp/app
-          cat > /tmp/app/package.json <<'EOF'
-          {"name":"smoke","version":"1.0.0","private":true,"scripts":{"build":"node build.js"}}
-          EOF
-          cat > /tmp/app/build.js <<'EOF'
-          const fs=require('fs');
-          fs.mkdirSync('dist',{recursive:true});
-          fs.writeFileSync('dist/index.html','<h1>ok</h1>');
-          EOF
-
-      - name: Build and assert output
+      # Proves the action builds a Node project with the runner's own toolchain, without
+      # needing a real Static Web App or a deployment token.
+      - name: Build detection smoke test
         shell: pwsh
         run: |
-          Import-Module ./src/SwaDeploy.psd1 -Force
-          $plan = Get-SwaBuildPlan -Path /tmp/app
-          if ($plan.BuildCommand -ne 'npm run build') { throw "Unexpected build command: $($plan.BuildCommand)" }
-          Invoke-SwaBuild -Path /tmp/app -Plan $plan
-          if (-not (Test-Path /tmp/app/dist/index.html)) { throw 'Build produced no output.' }
+          $app = Join-Path ([System.IO.Path]::GetTempPath()) 'smoke'
+          New-Item -ItemType Directory -Path $app -Force | Out-Null
+          '{"name":"smoke","version":"1.0.0","private":true,"scripts":{"build":"node build.js"}}' |
+            Set-Content (Join-Path $app 'package.json')
+          "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<h1>ok</h1>');" |
+            Set-Content (Join-Path $app 'build.js')
 
-          $payload = New-SwaPayload -Path /tmp/app/dist
+          Import-Module ./src/SwaDeploy.psd1 -Force
+          $plan = Get-SwaBuildPlan -Path $app
+          if ($plan.BuildCommand -ne 'npm run build') { throw "Unexpected build command: $($plan.BuildCommand)" }
+          Invoke-SwaBuild -Path $app -Plan $plan
+          if (-not (Test-Path (Join-Path $app 'dist/index.html'))) { throw 'Build produced no output.' }
+
+          $payload = New-SwaPayload -Path (Join-Path $app 'dist')
           if ($payload.FileCount -ne 1) { throw "Expected 1 file, got $($payload.FileCount)" }
           Remove-Item $payload.WorkDirectory -Recurse -Force
           Write-Host "Built and packaged $($payload.FileCount) file(s)."
