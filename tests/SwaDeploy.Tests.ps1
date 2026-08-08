@@ -288,67 +288,67 @@ Describe 'Copy-SwaZipSubdirectory zip-bomb guard' {
     }
 }
 
-Describe 'Test-SwaVersionSatisfies' {
+Describe 'Test-SwaVersionRange' {
     It 'accepts wildcards' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '*' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.11.0' -Range '*' | Should -BeTrue
     }
 
     It 'treats a bare major as an X-range' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '22' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '23.0.0' -Range '22' | Should -BeFalse
-        Test-SwaVersionSatisfies -Version '21.9.9' -Range '22' | Should -BeFalse
+        Test-SwaVersionRange -Version '22.11.0' -Range '22' | Should -BeTrue
+        Test-SwaVersionRange -Version '23.0.0' -Range '22' | Should -BeFalse
+        Test-SwaVersionRange -Version '21.9.9' -Range '22' | Should -BeFalse
     }
 
     It 'honours minor precision in an X-range' {
-        Test-SwaVersionSatisfies -Version '22.11.5' -Range '22.11' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '22.12.0' -Range '22.11' | Should -BeFalse
+        Test-SwaVersionRange -Version '22.11.5' -Range '22.11' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.12.0' -Range '22.11' | Should -BeFalse
     }
 
     It 'matches caret ranges on the minor and patch, not just the major' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '^22.10.0' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.11.0' -Range '^22.10.0' | Should -BeTrue
         # The major-only comparison this replaced wrongly accepted this
-        Test-SwaVersionSatisfies -Version '22.9.0' -Range '^22.10.0' | Should -BeFalse
-        Test-SwaVersionSatisfies -Version '23.0.0' -Range '^22.10.0' | Should -BeFalse
+        Test-SwaVersionRange -Version '22.9.0' -Range '^22.10.0' | Should -BeFalse
+        Test-SwaVersionRange -Version '23.0.0' -Range '^22.10.0' | Should -BeFalse
     }
 
     It 'pins the minor for caret ranges on 0.x' {
-        Test-SwaVersionSatisfies -Version '0.2.9' -Range '^0.2.3' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '0.3.0' -Range '^0.2.3' | Should -BeFalse
+        Test-SwaVersionRange -Version '0.2.9' -Range '^0.2.3' | Should -BeTrue
+        Test-SwaVersionRange -Version '0.3.0' -Range '^0.2.3' | Should -BeFalse
     }
 
     It 'matches tilde ranges on the minor' {
-        Test-SwaVersionSatisfies -Version '22.11.9' -Range '~22.11.0' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '22.12.0' -Range '~22.11.0' | Should -BeFalse
+        Test-SwaVersionRange -Version '22.11.9' -Range '~22.11.0' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.12.0' -Range '~22.11.0' | Should -BeFalse
     }
 
     It 'handles comparison operators' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '>=20' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '18.0.0' -Range '>=20' | Should -BeFalse
-        Test-SwaVersionSatisfies -Version '20.0.0' -Range '>20' | Should -BeFalse
-        Test-SwaVersionSatisfies -Version '18.1.0' -Range '<20' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.11.0' -Range '>=20' | Should -BeTrue
+        Test-SwaVersionRange -Version '18.0.0' -Range '>=20' | Should -BeFalse
+        Test-SwaVersionRange -Version '20.0.0' -Range '>20' | Should -BeFalse
+        Test-SwaVersionRange -Version '18.1.0' -Range '<20' | Should -BeTrue
     }
 
     It 'ANDs space-separated comparators' {
-        Test-SwaVersionSatisfies -Version '20.1.0' -Range '>=18 <21' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '22.0.0' -Range '>=18 <21' | Should -BeFalse
+        Test-SwaVersionRange -Version '20.1.0' -Range '>=18 <21' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.0.0' -Range '>=18 <21' | Should -BeFalse
     }
 
     It 'ORs alternatives separated by ||' {
-        Test-SwaVersionSatisfies -Version '20.1.0' -Range '18.x || 20.x' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '19.1.0' -Range '18.x || 20.x' | Should -BeFalse
+        Test-SwaVersionRange -Version '20.1.0' -Range '18.x || 20.x' | Should -BeTrue
+        Test-SwaVersionRange -Version '19.1.0' -Range '18.x || 20.x' | Should -BeFalse
     }
 
     It 'matches an exact pin exactly' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '22.11.0' | Should -BeTrue
-        Test-SwaVersionSatisfies -Version '22.11.1' -Range '22.11.0' | Should -BeFalse
+        Test-SwaVersionRange -Version '22.11.0' -Range '22.11.0' | Should -BeTrue
+        Test-SwaVersionRange -Version '22.11.1' -Range '22.11.0' | Should -BeFalse
     }
 
     It 'strips a leading v on either side' {
-        Test-SwaVersionSatisfies -Version 'v22.11.0' -Range 'v22' | Should -BeTrue
+        Test-SwaVersionRange -Version 'v22.11.0' -Range 'v22' | Should -BeTrue
     }
 
     It 'returns null for a range it cannot parse, rather than guessing' {
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range 'lts/hydrogen' | Should -BeNullOrEmpty
+        Test-SwaVersionRange -Version '22.11.0' -Range 'lts/hydrogen' | Should -BeNullOrEmpty
     }
 }
 

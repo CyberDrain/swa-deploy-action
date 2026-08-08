@@ -1,4 +1,6 @@
 ﻿#requires -Version 7.0
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 CyberDrain
 <#
 .SYNOPSIS
     GitHub Action entrypoint - maps Azure/static-web-apps-deploy inputs onto SwaDeploy.
