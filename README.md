@@ -1,4 +1,4 @@
-# Azure Static Web Apps Deploy
+# CyberDrain Azure SWA Deploy
 
 A drop-in replacement for [`Azure/static-web-apps-deploy`](https://github.com/Azure/static-web-apps-deploy). It talks to the same Azure content distribution API, but **starts working immediately instead of building a container first**, and **tells you why a deployment failed** instead of returning a dead-end string.
 
@@ -76,6 +76,14 @@ Failures land as `::error::` annotations and a job-summary table, not a PowerShe
 
 ---
 
+## Preview environments
+
+`deployment_environment` deploys to a named environment instead of production; `production_branch` sends every other branch to one named after the branch. Verified against a live app — the preview gets its own hostname (`<app>-<environment>.<region>.azurestaticapps.net`) and production is untouched.
+
+One Azure constraint worth knowing: **environment names may only contain letters and digits.** A branch called `feature/new-ui` is folded to `featurenewui` and the substitution is logged, because passing it through verbatim gets the deployment rejected outright.
+
+Teardown (`action: close`) isn't implemented — see [Not supported](#not-supported).
+
 ## Deploying from a URL
 
 Beyond the official input set: point at a prebuilt artifact and skip the checkout and build entirely.
@@ -139,7 +147,7 @@ Every input of the official action is accepted, so the swap is a one-line change
 | `app_build_command` | ✅ overrides detection |
 | `skip_app_build` | ✅ |
 | `config_file_location` | ✅ `staticwebapp.config.json` injected at payload root |
-| `deployment_environment`, `production_branch` | ✅ passed as environment info |
+| `deployment_environment`, `production_branch` | ✅ verified against a real preview deployment |
 | `skip_api_build`, `is_static_export` | ⚠️ accepted, no effect (Oryx-only hints) |
 | `repo_token`, `github_id_token` | ⚠️ accepted, unused — no PR commenting |
 | `api_location`, `api_build_command`, `data_api_location` | ❌ **fails** — managed Functions / Data API |

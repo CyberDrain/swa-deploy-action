@@ -229,6 +229,25 @@ Describe 'Resolve-SwaWorkspacePath' {
     }
 }
 
+Describe 'ConvertTo-SwaEnvironmentName' {
+    # Azure rejects anything outside 0-9a-zA-Z with
+    # 'The environment name provided has invalid character(s)'
+    It 'strips characters Azure rejects' -ForEach @(
+        @{ Branch = 'feature/new-ui'; Expected = 'featurenewui' }
+        @{ Branch = 'release-1.2.3'; Expected = 'release123' }
+        @{ Branch = 'dependabot/npm_and_yarn/pkg-1.0'; Expected = 'dependabotnpmandyarnpkg10' }
+        @{ Branch = 'main'; Expected = 'main' }
+        @{ Branch = 'PR42'; Expected = 'PR42' }
+    ) {
+        ConvertTo-SwaEnvironmentName -Branch $Branch | Should -Be $Expected
+    }
+
+    It 'returns empty when nothing usable remains, so the caller can fail loudly' {
+        ConvertTo-SwaEnvironmentName -Branch '---' | Should -BeNullOrEmpty
+        ConvertTo-SwaEnvironmentName -Branch '' | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Get-SwaRemoteZip' {
     BeforeEach {
         $script:target = Join-Path ([System.IO.Path]::GetTempPath()) "swa-dl-$([guid]::NewGuid().ToString('n')).zip"

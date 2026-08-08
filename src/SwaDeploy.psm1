@@ -223,6 +223,26 @@ function Resolve-SwaContentHost {
     }
 }
 
+function ConvertTo-SwaEnvironmentName {
+    <#
+    .SYNOPSIS
+        Folds a branch name into a valid Static Web Apps environment name.
+    .DESCRIPTION
+        Azure accepts only letters and digits here. Passing a branch through verbatim fails
+        the deployment with 'The environment name provided has invalid character(s)', so
+        everything else is stripped. Returns an empty string when nothing usable remains.
+    .EXAMPLE
+        ConvertTo-SwaEnvironmentName -Branch 'feature/new-ui'   # -> featurenewui
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Branch
+    )
+
+    return ($Branch -replace '[^0-9a-zA-Z]', '')
+}
+
 function Resolve-SwaWorkspacePath {
     <#
     .SYNOPSIS

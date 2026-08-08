@@ -151,7 +151,16 @@ $isPullRequest = $env:GITHUB_EVENT_NAME -eq 'pull_request'
 
 # A non-production branch is a preview environment when production_branch is declared
 if (-not $environmentName -and $productionBranch -and $branch -and $branch -ne $productionBranch) {
-    $environmentName = $branch
+    # Azure only accepts 0-9a-zA-Z here, so a branch like 'feature/new-ui' has to be folded
+    # down or the content server rejects the deployment outright
+    $environmentName = ConvertTo-SwaEnvironmentName -Branch $branch
+    if (-not $environmentName) {
+        throw "Cannot derive an environment name from branch '$branch' - it has no alphanumeric " +
+        'characters. Set deployment_environment explicitly.'
+    }
+    if ($environmentName -ne $branch) {
+        Write-Host "::notice::Branch '$branch' is not a valid environment name; using '$environmentName'."
+    }
     Write-Host "::notice::Deploying to preview environment '$environmentName' (production_branch is '$productionBranch')."
 }
 
