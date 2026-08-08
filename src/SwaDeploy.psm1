@@ -1,4 +1,6 @@
 #requires -Version 7.0
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 CyberDrain
 using namespace System.Net.Http
 using namespace System.Net.Http.Headers
 using namespace System.Text

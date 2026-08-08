@@ -1,4 +1,6 @@
 #requires -Version 7.0
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 CyberDrain
 <#
     Build support without Oryx.
 
@@ -167,7 +169,7 @@ function Compare-SwaVersion {
     return 0
 }
 
-function Test-SwaVersionSatisfies {
+function Test-SwaVersionRange {
     <#
     .SYNOPSIS
         Tests a concrete version against an npm-style range.
@@ -177,7 +179,7 @@ function Test-SwaVersionSatisfies {
         here because the same range decides which runtime gets downloaded, not just whether to
         warn. Ranges it cannot parse return null so callers can decline to act.
     .EXAMPLE
-        Test-SwaVersionSatisfies -Version '22.11.0' -Range '>=20 <23'
+        Test-SwaVersionRange -Version '22.11.0' -Range '>=20 <23'
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -318,7 +320,7 @@ function Resolve-SwaNodeVersion {
     $best = $null
     foreach ($entry in $Index) {
         if (-not $entry.version) { continue }
-        if ((Test-SwaVersionSatisfies -Version $entry.version -Range $Range) -ne $true) { continue }
+        if ((Test-SwaVersionRange -Version $entry.version -Range $Range) -ne $true) { continue }
 
         $parsed = ConvertTo-SwaVersion -Version $entry.version
         if (-not $parsed) { continue }
@@ -500,7 +502,7 @@ function Get-SwaNodeVersionCheck {
 
     $result.Installed = "$installedRaw".Trim().TrimStart('v')
 
-    $satisfied = Test-SwaVersionSatisfies -Version $result.Installed -Range $result.Requested
+    $satisfied = Test-SwaVersionRange -Version $result.Installed -Range $result.Requested
     # A null verdict means the range was unparseable - don't cry wolf
     $result.Satisfied = ($null -eq $satisfied) -or $satisfied
     return $result
@@ -607,5 +609,5 @@ function Invoke-SwaBuild {
 
 Export-ModuleMember -Function Get-SwaBuildPlan, Get-SwaPackageManager, Invoke-SwaBuild,
 Invoke-SwaExternalCommand, Get-SwaNodeVersionCheck, ConvertTo-SwaVersion, Compare-SwaVersion,
-Test-SwaVersionSatisfies, Get-SwaNodePlatform, Resolve-SwaNodeVersion, Install-SwaNode,
+Test-SwaVersionRange, Get-SwaNodePlatform, Resolve-SwaNodeVersion, Install-SwaNode,
 Add-SwaPathEntry

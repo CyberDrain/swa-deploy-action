@@ -1,5 +1,8 @@
 # CyberDrain Azure SWA Deploy
 
+[![CI](https://github.com/CyberDrain/swa-deploy-action/actions/workflows/ci.yml/badge.svg)](https://github.com/CyberDrain/swa-deploy-action/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A drop-in replacement for [`Azure/static-web-apps-deploy`](https://github.com/Azure/static-web-apps-deploy). It talks to the same Azure content distribution API, but **starts working immediately instead of building a container first**, and **tells you why a deployment failed** instead of returning a dead-end string.
 
 ```diff
@@ -26,24 +29,11 @@ The official action is a Docker action built from a `Dockerfile`, so **every job
                                     total 46s
 ```
 
-Step 2 doesn't exist for a composite action. That's the saving, and it's **per job** — a matrix across N sites pays it N times.
+Step 2 doesn't exist for a composite action, and it's paid **per job** — a matrix across N sites pays it N times.
 
-### What is *not* faster
+The upload itself is *not* faster. It's server-bound and identical for both clients: same 1,232-file / 59 MB site, 27s for the official action against 35s here, within run-to-run variance. The win is the container build you stop paying, plus failing in ~2s when the deploy was never going to succeed.
 
-The upload and content-distribution phase is server-bound and identical for both clients. Same 1,232-file / 59 MB site, same app, back to back:
-
-| | Deploy phase |
-|---|---:|
-| `Azure/static-web-apps-deploy` (image already cached) | 27s |
-| This action | 35s |
-
-That gap is run-to-run variance — repeated runs of this action alone ranged 21–35s. **Nobody wins the upload race; Azure sets that pace.** The win is the ~20s of container build you stop paying, plus not uploading at all when the deploy was never going to succeed.
-
-### Why composite, not a smaller container
-
-Containerizing would cost the thing that makes builds work: **runners already have Node, Python, .NET, Go and Java installed.** Oryx is 1.58 GB largely because it bundles its own copy of every runtime — inside a container it must, because the container can't see the runner's toolchain. On the host, `npm ci && npm run build` just uses the Node `actions/setup-node` already put there.
-
-Composite also runs on Windows and macOS runners; Docker actions are Linux-only. Every GitHub-hosted runner ships PowerShell 7, so there's nothing to install.
+This is a composite action, so it also runs on Windows and macOS runners — Docker actions are Linux-only.
 
 ---
 
@@ -55,16 +45,14 @@ The official client understates the payload it uploads, so quota breaches pass v
 Deployment failed: Failure during content distribution.
 ```
 
-That string is a dead end. The API returns nothing else, ARM returns nothing else, and the deployment has already spent the upload. This action reports the payload's **true file count and uncompressed size** in the upload request, so the content server rejects it up front, by name:
+Neither the API nor ARM returns anything more, and the upload is already spent. This action reports the payload's **true file count and uncompressed size** in the upload request, so the server rejects it up front, by name — in ~2s, before uploading a byte:
 
 ```
 The content server rejected /api/upload/request with 400.
 Reason: The number of static files was too large.
 ```
 
-~2 seconds, before uploading a byte.
-
-The same care applies to every other failure:
+Other failures get the same treatment:
 
 - **Nested and array error payloads are flattened**, so you get `DistributionFailed: Failure during content distribution.: blob upload denied` instead of `System.Object[]`.
 - **Failure envelopes are checked on every call.** The content server returns *HTTP 200* wrapping `isSuccessStatusCode: false` — miss that and the real reason is silently discarded.
@@ -112,11 +100,9 @@ Replicates what Oryx does for Node projects, using the runner's toolchain instea
 
 `build` runs only if `package.json` declares it. Commands run through the platform shell (`bash` on Linux/macOS, `pwsh` on Windows), so shell syntax works as written. Use `app_build_command` to override detection, or `skip_app_build: true` to deploy prebuilt output untouched.
 
-### Node version: resolved live, not bundled
+### Node version
 
-Oryx reads `engines.node` and switches to a runtime **baked into its image**. That set is frozen when the image is published, which is why it drifts out of date — `>=22` gets you whatever 22.x happened to exist at image build time, and adding a newer release means rebuilding and republishing 1.58 GB.
-
-Nothing is bundled here. The range is resolved against **nodejs.org's live release index**, so it keeps picking up current releases with nothing to rebuild:
+`engines.node` (or `.nvmrc`) is resolved against **nodejs.org's live release index**, so a range keeps selecting current releases — unlike Oryx, whose runtimes are frozen into its image:
 
 ```
 Node 24.11.1 (project asks for '20.x' via package.json engines.node)
@@ -131,9 +117,9 @@ How it resolves, cheapest first:
 2. **Version is in the runner tool cache** (e.g. `setup-node` put it there) → reused, no download.
 3. **Otherwise** → download from nodejs.org, **verify SHA256 against the release's published `SHASUMS256.txt`**, extract, and prepend to `PATH` for this action and later steps.
 
-Range support covers what actually appears in `engines.node`: `>=`, `>`, `<=`, `<`, `^`, `~`, `=`, bare and X-ranges, space-separated AND, and `||` alternatives — compared on major, minor **and** patch, since the same range decides which runtime gets downloaded. A range it can't parse is left alone rather than guessed at.
+Ranges support `>=`, `>`, `<=`, `<`, `^`, `~`, `=`, bare and X-ranges, space-separated AND, and `||`, compared on major, minor and patch. Unparseable ranges are left alone.
 
-If the download fails it warns and builds with the runner's Node rather than failing the deploy. Set `install_node: false` to always warn instead of installing:
+A failed download warns and builds with the runner's Node rather than failing the deploy. Set `install_node: false` to always warn instead:
 
 ```yaml
 - uses: CyberDrain/swa-deploy-action@v1
@@ -230,7 +216,7 @@ Test-SwaQuota -Payload (New-SwaPayload -Path ./dist)
 | `Resolve-SwaContentHost` | Derive the content host from a deployment token |
 | `Get-SwaBuildPlan` / `Invoke-SwaBuild` | Detect and run the project build |
 | `Resolve-SwaNodeVersion` / `Install-SwaNode` | Resolve a range against nodejs.org and install it |
-| `Test-SwaVersionSatisfies` | npm-style semver range matching |
+| `Test-SwaVersionRange` | npm-style semver range matching |
 | `ConvertTo-SwaErrorText` / `Get-SwaStatusError` | Flatten API error payloads |
 
 ## Development
@@ -242,4 +228,8 @@ pwsh -c "Invoke-ScriptAnalyzer -Path ./src -Recurse -Severity Error,Warning"
 
 ## Credits
 
-Extracted from CyberDrain's CIPP hosted-deployment tooling, where it deploys hundreds of Static Web Apps in parallel. The token parsing and API call sequence mirror Microsoft's `StaticSitesClient`.
+Extracted from CyberDrain's CIPP hosted-deployment tooling.
+
+## License
+
+[Apache License 2.0](LICENSE)
