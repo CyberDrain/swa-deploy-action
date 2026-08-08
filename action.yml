@@ -1,5 +1,5 @@
 name: "CyberDrain Azure SWA Deploy"
-description: "Drop-in replacement for Azure/static-web-apps-deploy that starts instantly instead of building a container every run, builds with the runner's own toolchain, and reports the real reason a deployment failed"
+description: "Drop-in replacement for Azure/static-web-apps-deploy focused on performance"
 branding:
   icon: "upload-cloud"
   color: "green"
