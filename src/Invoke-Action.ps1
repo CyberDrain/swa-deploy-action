@@ -142,7 +142,9 @@ if ($zipUrl) {
 
 $configPath = $null
 if ($configLocation) {
-    $configPath = Resolve-SwaWorkspacePath -Root $workspace -Path $configLocation -InputName 'config_file_location'
+    $configPath = Resolve-SwaConfigFilePath -WorkspaceRoot $workspace -ConfigFileLocation $configLocation
+} elseif (-not $zipUrl) {
+    $configPath = Resolve-SwaConfigFilePath -WorkspaceRoot $workspace -AppLocation $appLocation
 }
 
 # ---- environment / PR context ----

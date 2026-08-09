@@ -16,6 +16,7 @@
         'New-SwaPayload',
         'Get-SwaRemoteZip',
         'Resolve-SwaWorkspacePath',
+        'Resolve-SwaConfigFilePath',
         'ConvertTo-SwaEnvironmentName',
         'Test-SwaQuota',
         'Invoke-SwaDeployment',
