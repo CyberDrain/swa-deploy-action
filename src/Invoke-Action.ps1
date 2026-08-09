@@ -147,6 +147,25 @@ if ($configLocation) {
     $configPath = Resolve-SwaConfigFilePath -WorkspaceRoot $workspace -AppLocation $appLocation
 }
 
+# The zip is built from the content directory, so the config has to be at its root before
+# packaging - output_location usually points at a build folder like dist while the config
+# stays at app_location. Once it is there the payload carries it and there is nothing left
+# to inject into the finished zip.
+if ($configPath -and $contentPath -and (Test-Path -LiteralPath $contentPath -PathType Container)) {
+    $copied = Copy-SwaConfigFile -ConfigFilePath $configPath -DestinationRoot $contentPath
+    if ($copied) {
+        Write-Host "Copied staticwebapp.config.json from $configPath to the output root $contentPath"
+    } else {
+        Write-Host "staticwebapp.config.json is already at the output root $contentPath - keeping it."
+    }
+    $configPath = $null
+} elseif ($configPath) {
+    # A zip rather than a directory, so it gets injected at the payload root instead
+    Write-Host "staticwebapp.config.json will be added to the payload root from $configPath"
+} elseif (-not $zipUrl) {
+    Write-Host '::notice::No staticwebapp.config.json found - Static Web Apps platform defaults apply.'
+}
+
 # ---- environment / PR context ----
 $branch = $env:GITHUB_HEAD_REF
 if (-not $branch) { $branch = ($env:GITHUB_REF_NAME ?? '') }

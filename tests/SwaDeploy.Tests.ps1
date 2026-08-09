@@ -257,6 +257,69 @@ Describe 'Resolve-SwaConfigFilePath' {
     }
 }
 
+Describe 'Copy-SwaConfigFile' {
+    BeforeEach {
+        $script:workspace = Join-Path ([System.IO.Path]::GetTempPath()) "swa-copycfg-$([guid]::NewGuid().ToString('n'))"
+        $script:appDir = Join-Path $script:workspace 'app'
+        $script:outDir = Join-Path $script:appDir 'dist'
+        $null = New-Item -ItemType Directory -Path $script:outDir -Force
+        $script:sourceConfig = Join-Path $script:appDir 'staticwebapp.config.json'
+        '{"routes":[{"route":"/api/*","allowedRoles":["authenticated"]}]}' | Set-Content -Path $script:sourceConfig
+    }
+    AfterEach {
+        Remove-Item -LiteralPath $script:workspace -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'copies the config from app_location into the output root' {
+        $destination = Copy-SwaConfigFile -ConfigFilePath $script:sourceConfig -DestinationRoot $script:outDir
+
+        $destination | Should -Be (Join-Path $script:outDir 'staticwebapp.config.json')
+        Get-Content -LiteralPath $destination -Raw | Should -Be (Get-Content -LiteralPath $script:sourceConfig -Raw)
+    }
+
+    It 'accepts a directory as the config location' {
+        $destination = Copy-SwaConfigFile -ConfigFilePath $script:appDir -DestinationRoot $script:outDir
+
+        Test-Path -LiteralPath $destination -PathType Leaf | Should -BeTrue
+    }
+
+    It 'leaves a config already at the output root alone' {
+        $existing = Join-Path $script:outDir 'staticwebapp.config.json'
+        '{"routes":[]}' | Set-Content -Path $existing
+
+        Copy-SwaConfigFile -ConfigFilePath $script:sourceConfig -DestinationRoot $script:outDir |
+            Should -BeNullOrEmpty
+        Get-Content -LiteralPath $existing -Raw | Should -Match '"routes":\[\]'
+    }
+
+    It 'is a no-op when the output root is app_location itself' {
+        Copy-SwaConfigFile -ConfigFilePath $script:sourceConfig -DestinationRoot $script:appDir |
+            Should -BeNullOrEmpty
+    }
+
+    It 'throws when the config location has no staticwebapp.config.json' {
+        { Copy-SwaConfigFile -ConfigFilePath $script:outDir -DestinationRoot $script:outDir } |
+            Should -Throw '*does not contain staticwebapp.config.json*'
+    }
+
+    It 'throws when the destination is not a directory' {
+        { Copy-SwaConfigFile -ConfigFilePath $script:sourceConfig -DestinationRoot $script:sourceConfig } |
+            Should -Throw '*is not a directory*'
+    }
+
+    It 'lands the config in the zip once the payload is built from the output directory' {
+        'hello' | Set-Content -Path (Join-Path $script:outDir 'index.html')
+        $null = Copy-SwaConfigFile -ConfigFilePath $script:sourceConfig -DestinationRoot $script:outDir
+
+        $payload = New-SwaPayload -Path $script:outDir
+        try {
+            $payload.HasConfigFile | Should -BeTrue
+        } finally {
+            Remove-Item -LiteralPath $payload.WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Describe 'ConvertTo-SwaEnvironmentName' {
     # Azure rejects anything outside 0-9a-zA-Z with
     # 'The environment name provided has invalid character(s)'
