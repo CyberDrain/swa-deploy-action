@@ -553,6 +553,69 @@ function Copy-SwaZipSubdirectory {
     }
 }
 
+function Resolve-SwaConfigFileLeaf {
+    <#
+    .SYNOPSIS
+        Normalises a config location - directory or file - to the file itself.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$ConfigFilePath
+    )
+
+    $configFile = $ConfigFilePath
+    if (Test-Path -LiteralPath $configFile -PathType Container) {
+        $configFile = Join-Path $configFile 'staticwebapp.config.json'
+    }
+    if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) {
+        throw "config_file_location does not contain staticwebapp.config.json: $ConfigFilePath"
+    }
+
+    return $configFile
+}
+
+function Copy-SwaConfigFile {
+    <#
+    .SYNOPSIS
+        Copies staticwebapp.config.json into the root of the content directory.
+    .DESCRIPTION
+        The payload zip is built from the content directory, so the config has to be sitting
+        at its root before packaging. output_location commonly points at a build folder like
+        dist while the config stays at app_location, which would otherwise leave it out of the
+        deployment. A config already at the content root wins and is left untouched.
+        Returns the path it wrote, or $null when it copied nothing.
+    .EXAMPLE
+        Copy-SwaConfigFile -ConfigFilePath ./app/staticwebapp.config.json -DestinationRoot ./app/dist
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$ConfigFilePath,
+        [Parameter(Mandatory)][string]$DestinationRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $DestinationRoot -PathType Container)) {
+        throw "Cannot place staticwebapp.config.json: '$DestinationRoot' is not a directory."
+    }
+
+    $configFile = Resolve-SwaConfigFileLeaf -ConfigFilePath $ConfigFilePath
+    $destination = Join-Path $DestinationRoot 'staticwebapp.config.json'
+
+    # Covers the config already living at the content root, including the case where the
+    # source and the destination are the same file
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        Write-Verbose '[SWA] staticwebapp.config.json already at the output root; keeping it'
+        return $null
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($destination, 'Copy staticwebapp.config.json')) { return $null }
+
+    Copy-Item -LiteralPath $configFile -Destination $destination
+    Write-Verbose "[SWA] Copied staticwebapp.config.json from $configFile to $DestinationRoot"
+    return $destination
+}
+
 function Add-SwaConfigFile {
     <#
     .SYNOPSIS
@@ -564,13 +627,7 @@ function Add-SwaConfigFile {
         [Parameter(Mandatory)][string]$ConfigFilePath
     )
 
-    $configFile = $ConfigFilePath
-    if (Test-Path -LiteralPath $configFile -PathType Container) {
-        $configFile = Join-Path $configFile 'staticwebapp.config.json'
-    }
-    if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) {
-        throw "config_file_location does not contain staticwebapp.config.json: $ConfigFilePath"
-    }
+    $configFile = Resolve-SwaConfigFileLeaf -ConfigFilePath $ConfigFilePath
 
     $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Update)
     try {
