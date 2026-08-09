@@ -282,6 +282,38 @@ function Resolve-SwaWorkspacePath {
     return $full
 }
 
+function Resolve-SwaConfigFilePath {
+    <#
+    .SYNOPSIS
+        Resolves staticwebapp.config.json from an explicit location or app_location.
+    .DESCRIPTION
+        staticwebapp.config.json carries routing and security policy. When output_location
+        points at built files in a child folder like dist, the config commonly stays at
+        app_location and must still be copied into the deployment payload root.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceRoot,
+        [string]$AppLocation,
+        [string]$ConfigFileLocation
+    )
+
+    if ($ConfigFileLocation) {
+        return Resolve-SwaWorkspacePath -Root $WorkspaceRoot -Path $ConfigFileLocation -InputName 'config_file_location'
+    }
+
+    if (-not $AppLocation) { return $null }
+
+    $appRoot = Resolve-SwaWorkspacePath -Root $WorkspaceRoot -Path $AppLocation -InputName 'app_location'
+    $defaultConfig = Join-Path $appRoot 'staticwebapp.config.json'
+    if (Test-Path -LiteralPath $defaultConfig -PathType Leaf) {
+        return $defaultConfig
+    }
+
+    return $null
+}
+
 function Get-SwaRemoteZip {
     <#
     .SYNOPSIS

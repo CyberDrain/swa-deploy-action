@@ -229,6 +229,34 @@ Describe 'Resolve-SwaWorkspacePath' {
     }
 }
 
+Describe 'Resolve-SwaConfigFilePath' {
+    BeforeEach {
+        $script:workspace = Join-Path ([System.IO.Path]::GetTempPath()) "swa-config-$([guid]::NewGuid().ToString('n'))"
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:workspace 'app/dist') -Force
+    }
+    AfterEach {
+        Remove-Item -LiteralPath $script:workspace -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'finds staticwebapp.config.json at app_location when config_file_location is omitted' {
+        $configPath = Join-Path $script:workspace 'app/staticwebapp.config.json'
+        '{"globalHeaders":{"X-Frame-Options":"DENY"}}' | Set-Content -Path $configPath
+
+        Resolve-SwaConfigFilePath -WorkspaceRoot $script:workspace -AppLocation 'app' |
+            Should -Be ([System.IO.Path]::GetFullPath($configPath))
+    }
+
+    It 'prefers an explicit config_file_location' {
+        $configDir = Join-Path $script:workspace 'security'
+        $null = New-Item -ItemType Directory -Path $configDir -Force
+        $configPath = Join-Path $configDir 'staticwebapp.config.json'
+        '{"routes":[]}' | Set-Content -Path $configPath
+
+        Resolve-SwaConfigFilePath -WorkspaceRoot $script:workspace -AppLocation 'app' -ConfigFileLocation 'security' |
+            Should -Be ([System.IO.Path]::GetFullPath($configDir))
+    }
+}
+
 Describe 'ConvertTo-SwaEnvironmentName' {
     # Azure rejects anything outside 0-9a-zA-Z with
     # 'The environment name provided has invalid character(s)'
