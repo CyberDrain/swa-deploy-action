@@ -160,3 +160,8 @@ jobs:
             throw "$($script:failures.Count) entrypoint assertion(s) failed."
           }
           Write-Host 'Entrypoint reports every failure as an annotation and a summary table.'
+
+          # Every run above exits non-zero on purpose, and the pwsh shell appends
+          # 'exit $LASTEXITCODE' - so without this the step fails on the exit code it was
+          # asserting. A failed assertion still throws, which exits non-zero on its own.
+          exit 0
