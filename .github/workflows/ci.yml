@@ -72,3 +72,91 @@ jobs:
           if ($payload.FileCount -ne 1) { throw "Expected 1 file, got $($payload.FileCount)" }
           Remove-Item $payload.WorkDirectory -Recurse -Force
           Write-Host "Built and packaged $($payload.FileCount) file(s)."
+
+      # Drives the entrypoint the way a runner does - INPUT_* variables and file-backed
+      # GITHUB_OUTPUT/GITHUB_STEP_SUMMARY - to prove failures come back as annotations rather
+      # than as PowerShell error records, which no unit test can show.
+      - name: Entrypoint failure reporting
+        shell: pwsh
+        run: |
+          $root = Join-Path ([System.IO.Path]::GetTempPath()) 'entrypoint'
+          $script:failures = @()
+
+          function Invoke-FakeRun {
+            param([hashtable]$Inputs, [string]$Name)
+
+            Get-ChildItem Env: | Where-Object Name -like 'INPUT_*' | Remove-Item
+            $run = Join-Path $root $Name
+            New-Item -ItemType Directory -Path $run -Force | Out-Null
+            $env:GITHUB_WORKSPACE = $run
+            $env:GITHUB_OUTPUT = Join-Path $run 'output.txt'
+            $env:GITHUB_STEP_SUMMARY = Join-Path $run 'summary.md'
+            New-Item -ItemType File -Path $env:GITHUB_OUTPUT, $env:GITHUB_STEP_SUMMARY -Force | Out-Null
+            foreach ($key in $Inputs.Keys) { Set-Item "Env:INPUT_$($key.ToUpperInvariant())" $Inputs[$key] }
+
+            $log = & pwsh -NoProfile -File ./src/Invoke-Action.ps1 2>&1 | Out-String
+            return [pscustomobject]@{
+              ExitCode = $LASTEXITCODE
+              Log      = $log
+              Output   = Get-Content $env:GITHUB_OUTPUT -Raw
+              Summary  = Get-Content $env:GITHUB_STEP_SUMMARY -Raw
+              Path     = $run
+            }
+          }
+
+          function Assert-Run {
+            param($Run, [string]$Case, [string[]]$LogMatches, [string[]]$OutputMatches)
+            if ($Run.ExitCode -eq 0) { $script:failures += "${Case}: expected a non-zero exit" }
+            if ($Run.Log -match 'at <ScriptBlock>|ScriptStackTrace|\+\s+CategoryInfo') {
+              $script:failures += "${Case}: a raw PowerShell error record reached the log"
+            }
+            foreach ($pattern in $LogMatches) {
+              if ($Run.Log -notmatch $pattern) { $script:failures += "${Case}: log did not match '$pattern'" }
+            }
+            foreach ($pattern in $OutputMatches) {
+              if ($Run.Output -notmatch $pattern) { $script:failures += "${Case}: output did not match '$pattern'" }
+            }
+            if ($Run.Summary -notmatch '\|---\|---\|') { $script:failures += "${Case}: no summary table" }
+          }
+
+          # A rejected input
+          $bad = Invoke-FakeRun -Name 'badaction' -Inputs @{
+            azure_static_web_apps_api_token = 'x' * 104
+            action                          = 'close'
+          }
+          Assert-Run -Run $bad -Case 'unsupported action' `
+            -LogMatches @('::error::Input validation failed:.*is not supported') `
+            -OutputMatches @('deployment_status=Error')
+
+          # A build that exits non-zero
+          $buildRun = Join-Path $root 'badbuild'
+          New-Item -ItemType Directory -Path $buildRun -Force | Out-Null
+          '{"name":"b","version":"1.0.0","private":true,"scripts":{"build":"node -e \"process.exit(3)\""}}' |
+            Set-Content (Join-Path $buildRun 'package.json')
+          $build = Invoke-FakeRun -Name 'badbuild' -Inputs @{
+            azure_static_web_apps_api_token = 'x' * 104
+          }
+          Assert-Run -Run $build -Case 'failing build' `
+            -LogMatches @('::error::Build failed:') `
+            -OutputMatches @('deployment_status=Error', 'build_duration_seconds=')
+
+          # require_config_file: error must refuse before anything is uploaded. The token is
+          # well-formed but fake, so reaching the network at all would be the failure.
+          $gateRun = Join-Path $root 'gate'
+          New-Item -ItemType Directory -Path (Join-Path $gateRun 'dist') -Force | Out-Null
+          '<h1>ok</h1>' | Set-Content (Join-Path $gateRun 'dist/index.html')
+          $gate = Invoke-FakeRun -Name 'gate' -Inputs @{
+            azure_static_web_apps_api_token = ('a' * 64) + '-' + ('b' * 36) + '003'
+            output_location                 = 'dist'
+            skip_app_build                  = 'true'
+            require_config_file             = 'error'
+          }
+          Assert-Run -Run $gate -Case 'require_config_file error' `
+            -LogMatches @('::error::.*Nothing was uploaded') `
+            -OutputMatches @('deployment_status=Error')
+
+          if ($script:failures) {
+            $script:failures | ForEach-Object { Write-Host "FAIL: $_" }
+            throw "$($script:failures.Count) entrypoint assertion(s) failed."
+          }
+          Write-Host 'Entrypoint reports every failure as an annotation and a summary table.'

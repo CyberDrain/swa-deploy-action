@@ -60,7 +60,50 @@ Other failures get the same treatment:
 - **Unrecognized fields fall back to raw JSON** rather than being dropped, so a payload shape we've never seen still reaches you.
 - **Failures carry context** — content host and correlation ID, which is what Azure support asks for first.
 
-Failures land as `::error::` annotations and a job-summary table, not a PowerShell stack trace.
+Failures land as `::error::` annotations and a job-summary table, not a PowerShell stack trace. That covers *every* stage, not just the deployment — a rejected input, a build that exits non-zero and a refused upload all name the stage that broke:
+
+```
+::error::Build failed: Command failed with exit code 3: npm run build
+```
+
+Transient trouble is retried rather than reported as failure: HTTP calls get bounded exponential backoff with jitter on connection faults and 408/429/500/502/503/504 (honouring `Retry-After`), while genuine rejections fail immediately — retrying a quota breach only makes a precise error slow. A status check that fails during distribution is treated as a lost look at the deployment rather than a failed one; only five consecutive failures give up, and that reports `Unknown`, not `Failed`, because Azure is probably still finishing. Every request carries its own timeout budget, so a large upload is no longer cancelled by .NET's 100-second default.
+
+---
+
+## Deploying without your auth rules
+
+`staticwebapp.config.json` carries `routes` and `allowedRoles`. If it doesn't reach the payload root, Azure applies platform defaults — **every route is served anonymously** — and nothing in a green run says so.
+
+`require_config_file` decides what happens when the payload has no config, or one that won't parse:
+
+| Value | Behaviour |
+|---|---|
+| `warn` *(default)* | `::warning::` annotation and a summary row |
+| `error` | Refuses to deploy. Nothing is uploaded — the check runs after packaging but before the first API call |
+| `off` | Silent |
+
+Presence is measured from the finished zip, not guessed from `app_location`, so it is correct whether the config was committed next to the source, emitted into `output_location` by the build, injected from `config_file_location`, or already inside a `zip_url` download.
+
+The config is parsed too — comments and trailing commas included, since Azure-bound configs are hand-maintained — and the run reports what it found:
+
+| | |
+|---|---|
+| **Config** | `staticwebapp.config.json` - 12 routes, 4 role-protected, roles: admin, editor, fallback: /index.html |
+
+Those roles are also sent to Azure in the upload request as `ConfiguredRoles`, rather than the empty list the deployment used to claim.
+
+### What else is in the payload
+
+With the default `app_location: "/"` and no `output_location`, the payload is the whole workspace. The run says so rather than quietly shipping it:
+
+```
+::warning::the payload contains .git (412 files) - repository history would be
+served publicly. Point output_location at the build folder.
+::warning::the payload contains '.env.production' - environment files are served
+publicly and often hold secrets.
+```
+
+Nothing is excluded automatically — dropping files would change what a site serves, and the official action doesn't exclude them either.
 
 ---
 
@@ -149,7 +192,7 @@ Every input of the official action is accepted, so the swap is a one-line change
 | `app_location`, `output_location`, `app_artifact_location` | ✅ |
 | `app_build_command` | ✅ overrides detection |
 | `skip_app_build` | ✅ |
-| `config_file_location` | ✅ `staticwebapp.config.json` injected at payload root |
+| `config_file_location` | ✅ `staticwebapp.config.json` injected at payload root, and its absence [can block the deploy](#deploying-without-your-auth-rules) |
 | `deployment_environment`, `production_branch` | ✅ verified against a real preview deployment |
 | `skip_api_build`, `is_static_export` | ⚠️ accepted, no effect (Oryx-only hints) |
 | `repo_token`, `github_id_token` | ⚠️ accepted, unused — no PR commenting |
@@ -158,9 +201,31 @@ Every input of the official action is accepted, so the swap is a one-line change
 
 Unsupported inputs fail loudly rather than being silently ignored, so a half-migrated workflow can't quietly deploy something wrong.
 
-**Additional inputs:** `install_node`, `zip_url`, `zip_subdirectory`, `max_download_mb`, `verbose`.
+**Additional inputs:** `require_config_file`, `install_node`, `zip_url`, `zip_subdirectory`, `max_download_mb`, `verbose`.
 
-**Output:** `static_web_app_url`.
+### Outputs
+
+| Output | Value |
+|---|---|
+| `static_web_app_url` | Deployed URL. Falls back to the default hostname when the API returns an empty `siteUrl` |
+| `deployment_status` | `Succeeded`, `Failed`, `Canceled`, `TimedOut`, `Unknown`, or `Error` (failed before deploying) |
+| `deployment_environment` | Environment deployed to; empty means production |
+| `file_count`, `app_size_bytes`, `compressed_size_bytes` | Payload as measured |
+| `has_config_file` | `true` when `staticwebapp.config.json` was at the payload root |
+| `build_duration_seconds`, `deploy_duration_seconds`, `total_duration_seconds` | Timings |
+| `correlation_id` | What Azure support asks for first |
+
+Outputs are written on failure as well as on success, so a follow-up step can report on a broken deployment — that step needs `if: always()`:
+
+```yaml
+- id: deploy
+  uses: CyberDrain/swa-deploy-action@v1
+  with:
+    azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+
+- if: always()
+  run: echo "${{ steps.deploy.outputs.deployment_status }} in ${{ steps.deploy.outputs.total_duration_seconds }}s"
+```
 
 ### Not supported
 
@@ -209,11 +274,14 @@ Test-SwaQuota -Payload (New-SwaPayload -Path ./dist)
 | Function | Purpose |
 |---|---|
 | `Invoke-SwaDeployment` | Full deploy: package, validate, upload, poll |
-| `New-SwaPayload` | Build the zip and measure it |
+| `New-SwaPayload` | Build the zip, measure it, and read the config out of it |
+| `Get-SwaConfigReport` | Parse `staticwebapp.config.json` and report its route/auth posture |
 | `Test-SwaQuota` | Report file-count / size breaches |
 | `Get-SwaRemoteZip` | Download a zip under a size cap |
 | `Resolve-SwaWorkspacePath` | Resolve a path input, rejecting workspace escapes |
 | `Resolve-SwaContentHost` | Derive the content host from a deployment token |
+| `Invoke-SwaWithRetry` / `Invoke-SwaHttpRequest` | Retry transient failures with bounded backoff |
+| `Read-SwaUploadTicket` / `Read-SwaDeploymentStatus` | Read API responses without assuming their shape |
 | `Get-SwaBuildPlan` / `Invoke-SwaBuild` | Detect and run the project build |
 | `Resolve-SwaNodeVersion` / `Install-SwaNode` | Resolve a range against nodejs.org and install it |
 | `Test-SwaVersionRange` | npm-style semver range matching |
@@ -223,8 +291,10 @@ Test-SwaQuota -Payload (New-SwaPayload -Path ./dist)
 
 ```bash
 pwsh -c "Invoke-Pester ./tests"
-pwsh -c "Invoke-ScriptAnalyzer -Path ./src -Recurse -Severity Error,Warning"
+pwsh -c "Invoke-ScriptAnalyzer -Path ./src -Recurse -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost"
 ```
+
+`tests/ActionContract.Tests.ps1` asserts the wiring an input needs — declared in `action.yml`, forwarded as `INPUT_*` in the composite step's `env:`, and read by the entrypoint. Composite actions get no automatic `INPUT_*` variables, so doing two of those three is the easy mistake.
 
 ## Credits
 

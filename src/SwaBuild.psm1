@@ -108,10 +108,11 @@ function Get-SwaBuildPlan {
     $plan.InstallCommand = $manager.InstallCommand
     $plan.NodeVersion = Get-SwaNodeVersionCheck -Path $Path
 
-    $scripts = $null
-    if ($packageJson.PSObject.Properties.Name -contains 'scripts') { $scripts = $packageJson.scripts }
+    # Via Get-SwaProperty: a package.json of '{}' has no properties at all, and enumerating
+    # .Name off the empty collection is itself a StrictMode error
+    $scripts = Get-SwaProperty -InputObject $packageJson -Name 'scripts'
 
-    if ($scripts -and $scripts.PSObject.Properties.Name -contains 'build') {
+    if (Get-SwaProperty -InputObject $scripts -Name 'build') {
         $plan.BuildCommand = $manager.BuildCommand
         $plan.Reason = "Detected a $($manager.Name) project with a build script."
     } else {
@@ -471,9 +472,10 @@ function Get-SwaNodeVersionCheck {
     if (Test-Path -LiteralPath $packageJsonPath) {
         try {
             $packageJson = Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json
-            if ($packageJson.PSObject.Properties.Name -contains 'engines' -and $packageJson.engines -and
-                $packageJson.engines.PSObject.Properties.Name -contains 'node') {
-                $result.Requested = "$($packageJson.engines.node)".Trim()
+            $engines = Get-SwaProperty -InputObject $packageJson -Name 'engines'
+            $engineNode = Get-SwaProperty -InputObject $engines -Name 'node'
+            if ($engineNode) {
+                $result.Requested = "$engineNode".Trim()
                 $result.Source = 'package.json engines.node'
                 $result.VersionFile = 'package.json'
             }

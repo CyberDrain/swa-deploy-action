@@ -15,6 +15,46 @@ Set-StrictMode -Version Latest
 $script:DefaultMaxFileCount = 15000
 $script:DefaultMaxAppSizeBytes = 500MB
 
+# staticwebapp.config.json is read out of the payload before the quota check runs, and for a
+# downloaded zip that happens without the archive ever having been inflated. A routing file
+# does not approach this; a zip bomb entry named like one does.
+$script:MaxConfigFileBytes = 8MB
+
+function Get-SwaProperty {
+    <#
+    .SYNOPSIS
+        Reads a property that may not be there, without tripping StrictMode.
+    .DESCRIPTION
+        Under Set-StrictMode -Version Latest a missing property is a terminating
+        PropertyNotFoundException, so an optimistic chain over an API response reports a
+        changed payload shape as a PowerShell internal - and does it before the friendly
+        guard written to catch exactly that case can run.
+    #>
+    [CmdletBinding()]
+    param(
+        $InputObject,
+        [Parameter(Mandatory)][string]$Name,
+        $Default = $null
+    )
+
+    if ($null -eq $InputObject) { return $Default }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if (-not $InputObject.Contains($Name)) { return $Default }
+        $value = $InputObject[$Name]
+    } else {
+        # Indexed rather than '.Properties.Name -contains': on an object with no properties
+        # at all - '{}' from the API, say - enumerating .Name off the empty collection is
+        # itself a StrictMode error, which is the exact failure this function exists to stop
+        $property = $InputObject.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $Default }
+        $value = $property.Value
+    }
+
+    if ($null -eq $value) { return $Default }
+    return $value
+}
+
 function ConvertTo-SwaErrorText {
     <#
     .SYNOPSIS
@@ -58,7 +98,9 @@ function ConvertTo-SwaErrorText {
             'message', 'errorMessage', 'error', 'errorDetails', 'description', 'reason',
             'innerError', 'innerErrorDetails', 'innerException', 'details', 'detail', 'exceptionMessage'
         )
-        $available = $ErrorObject.PSObject.Properties.Name
+        # @() around it: on an object with no properties, enumerating .Name off the empty
+        # collection is itself a StrictMode error
+        $available = @($ErrorObject.PSObject.Properties | ForEach-Object { $_.Name })
         $parts = [System.Collections.Generic.List[string]]::new()
 
         foreach ($name in $errorProperties) {
@@ -98,8 +140,7 @@ function Get-SwaStatusError {
         'tenantId', 'snippetsMap', 'sku', 'environmentName', 'unhealthyRegions'
     )
 
-    $response = $null
-    if ($Status.PSObject.Properties.Name -contains 'response') { $response = $Status.response }
+    $response = Get-SwaProperty -InputObject $Status -Name 'response'
 
     $detail = $null
     if ($response) {
@@ -115,8 +156,7 @@ function Get-SwaStatusError {
         }
     }
 
-    $envelopeError = $null
-    if ($Status.PSObject.Properties.Name -contains 'errorMessage') { $envelopeError = $Status.errorMessage }
+    $envelopeError = Get-SwaProperty -InputObject $Status -Name 'errorMessage'
 
     $parts = [System.Collections.Generic.List[string]]::new()
     foreach ($candidate in @($detail, $envelopeError)) {
@@ -125,9 +165,9 @@ function Get-SwaStatusError {
     }
 
     # Regional distribution failures name the regions here rather than in errorDetails
-    if ($response -and $response.PSObject.Properties.Name -contains 'unhealthyRegions') {
+    if ($response) {
         # Wrap the whole pipeline: filtering an empty list yields $null, not an empty array
-        $unhealthy = @($response.unhealthyRegions | Where-Object { $_ })
+        $unhealthy = @((Get-SwaProperty -InputObject $response -Name 'unhealthyRegions' -Default @()) | Where-Object { $_ })
         if ($unhealthy.Count -gt 0) { $parts.Add("unhealthy regions: $($unhealthy -join ', ')") }
     }
 
@@ -314,6 +354,277 @@ function Resolve-SwaConfigFilePath {
     return $null
 }
 
+function Invoke-SwaWithRetry {
+    <#
+    .SYNOPSIS
+        Runs a scriptblock, retrying only failures that look transient.
+    .DESCRIPTION
+        A deployment is a handful of calls with no cheap way to resume, so a single dropped
+        connection or 503 on the way through would otherwise cost the whole job. Only signals
+        that plausibly succeed on a second attempt are retried: connection faults, timeouts
+        and the transient HTTP statuses. A rejection the server meant - a quota breach, a bad
+        token, a malformed config - is raised immediately, because retrying turns a precise
+        two-second failure into a slow one.
+    .EXAMPLE
+        Invoke-SwaWithRetry -Operation 'upload app.zip' -ScriptBlock { $client.Send($request) }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [string]$Operation = 'request',
+        [int]$MaxAttempts = 4,
+        [double]$BaseDelaySeconds = 2,
+
+        # Seam for tests: replaced with a no-op so backoff costs nothing
+        [scriptblock]$WaitAction = { param([double]$Seconds) Start-Sleep -Seconds $Seconds }
+    )
+
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            $retryable = Test-SwaTransientFailure -ErrorRecord $_
+            if (-not $retryable -or $attempt -ge $MaxAttempts) { throw }
+
+            # Jitter keeps a matrix fan-out from retrying in lockstep against one region,
+            # which is how a single 429 becomes a throttling storm
+            $delay = [math]::Min($BaseDelaySeconds * [math]::Pow(2, $attempt - 1), 30)
+            $delay += (Get-Random -Minimum 0.0 -Maximum 1.0)
+            $hint = Get-SwaRetryAfterDelay -ErrorRecord $_
+            if ($hint -gt 0) { $delay = [math]::Min($hint, 60) }
+
+            Write-Warning ("[SWA] {0} failed (attempt {1}/{2}): {3}. Retrying in {4}s." -f
+                $Operation, $attempt, $MaxAttempts, $_.Exception.Message, [math]::Round($delay, 1))
+            & $WaitAction $delay
+        }
+    }
+}
+
+function Invoke-SwaHttpRequest {
+    <#
+    .SYNOPSIS
+        Sends an HTTP request with its own timeout budget, retrying transient failures.
+    .DESCRIPTION
+        RequestFactory is invoked once per attempt rather than taking a ready-made message:
+        an HttpRequestMessage cannot be sent twice, and a retried blob upload has to re-open
+        the zip at offset zero rather than resume from wherever the failed attempt stopped.
+
+        Each attempt gets its own CancellationTokenSource instead of a client-wide timeout,
+        because one deadline cannot cover both a 2 KB JSON POST and a 300 MB upload. Blowing
+        that budget is deliberately not treated as transient - waiting longer will not help.
+
+        A transient status is a response, not an exception, so it is raised as one to reach
+        the retry loop. When the attempts run out the last response is handed back rather than
+        thrown, leaving the caller to render the server's own reason as it would have anyway.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Net.Http.HttpResponseMessage])]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+        Justification = 'Used inside the retry scriptblock, which the analyzer does not follow.')]
+    param(
+        [Parameter(Mandatory)][HttpClient]$Client,
+        [Parameter(Mandatory)][scriptblock]$RequestFactory,
+        [Parameter(Mandatory)][string]$Operation,
+        [int]$TimeoutSeconds = 100,
+        [int]$MaxAttempts = 4,
+        [HttpCompletionOption]$CompletionOption = [HttpCompletionOption]::ResponseContentRead,
+
+        # Empty disables status-based retry, for a call that must not be repeated once it lands
+        [int[]]$RetryStatusCodes = @(408, 429, 500, 502, 503, 504),
+
+        [scriptblock]$WaitAction = { param([double]$Seconds) Start-Sleep -Seconds $Seconds }
+    )
+
+    # A hashtable rather than a plain variable: a scriptblock assignment would land in the
+    # scriptblock's own scope and never reach us
+    $state = @{ LastResponse = $null }
+
+    try {
+        return Invoke-SwaWithRetry -Operation $Operation -MaxAttempts $MaxAttempts -WaitAction $WaitAction -ScriptBlock {
+            # Cleared before the factory runs, not after: a factory that throws on a retry -
+            # the zip vanishing under a re-open, say - must not leave the previous attempt's
+            # 503 behind for the outer catch to return in place of the real error
+            if ($state.LastResponse) { $state.LastResponse.Dispose(); $state.LastResponse = $null }
+
+            $request = & $RequestFactory
+            $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
+            try {
+                try {
+                    $response = $Client.SendAsync($request, $CompletionOption, $cancellation.Token).GetAwaiter().GetResult()
+                } catch [System.OperationCanceledException] {
+                    if ($cancellation.IsCancellationRequested) {
+                        throw "$Operation timed out after ${TimeoutSeconds}s."
+                    }
+                    throw
+                }
+
+                if ($RetryStatusCodes -contains [int]$response.StatusCode) {
+                    $state.LastResponse = $response
+                    $hint = ''
+                    if ($response.Headers.RetryAfter -and $response.Headers.RetryAfter.Delta) {
+                        $hint = " Retry-After: $([int]$response.Headers.RetryAfter.Delta.TotalSeconds)"
+                    }
+                    throw "$Operation returned $([int]$response.StatusCode) $($response.ReasonPhrase).$hint"
+                }
+
+                return $response
+            } finally {
+                # Disposes the request's content too, which for an upload is the file stream
+                $request.Dispose()
+                $cancellation.Dispose()
+            }
+        }
+    } catch {
+        # Out of attempts on a status the server may yet recover from - let the caller read it
+        if ($state.LastResponse) { return $state.LastResponse }
+        throw
+    }
+}
+
+function Test-SwaTransientFailure {
+    <#
+    .SYNOPSIS
+        Decides whether a failure is worth another attempt.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if ($exception -is [System.Net.Http.HttpRequestException] -or
+            $exception -is [System.Net.Sockets.SocketException] -or
+            $exception -is [System.IO.IOException] -or
+            $exception -is [System.TimeoutException] -or
+            $exception -is [System.Threading.Tasks.TaskCanceledException] -or
+            $exception -is [System.OperationCanceledException]) {
+            return $true
+        }
+        $exception = $exception.InnerException
+    }
+
+    # The content server's own rejections are raised as plain messages carrying the status,
+    # so the status is what separates 'try again' from 'this will never work'
+    $message = "$($ErrorRecord.Exception.Message)"
+    if ($message -match '\b(408|429|500|502|503|504)\b') { return $true }
+    if ($message -match '(?i)\b(RequestTimeout|TooManyRequests|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|ServerBusy|OperationTimedOut)\b') { return $true }
+
+    return $false
+}
+
+function Get-SwaRetryAfterDelay {
+    <#
+    .SYNOPSIS
+        Pulls a Retry-After hint out of a failure message, when the server sent one.
+    #>
+    [CmdletBinding()]
+    [OutputType([double])]
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    if ("$($ErrorRecord.Exception.Message)" -match '(?i)retry[- ]after[:= ]+(\d+)') {
+        return [double]$Matches[1]
+    }
+    return 0
+}
+
+function Get-SwaConfigReport {
+    <#
+    .SYNOPSIS
+        Parses staticwebapp.config.json and reports its routing and authentication posture.
+    .DESCRIPTION
+        The config carries the route rules and allowedRoles that keep an authenticated site
+        closed. Reporting what it actually contains turns an accidentally wide-open deployment
+        into something visible in the run instead of something discovered in production, and
+        gives the upload request real values for HasRoutes and ConfiguredRoles.
+
+        Comments and trailing commas are tolerated. ConvertFrom-Json rejects both outright,
+        and hand-maintained configs carry them often enough that failing on one would block a
+        deployment Azure would have accepted. A parse failure that survives even the tolerant
+        reader is reported rather than thrown, so the caller decides how fatal it is - but
+        either way Azure would not apply the rules, which is the case require_config_file
+        exists to catch.
+    .EXAMPLE
+        Get-SwaConfigReport -ConfigFilePath ./dist/staticwebapp.config.json
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$ConfigFilePath
+    )
+
+    $report = [ordered]@{
+        Path                = $ConfigFilePath
+        IsValidJson         = $false
+        ParseError          = $null
+        HasRoutes           = $false
+        RouteCount          = 0
+        ProtectedRouteCount = 0
+        Roles               = @()
+        NavigationFallback  = $null
+    }
+
+    $raw = Get-Content -LiteralPath $ConfigFilePath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $report.ParseError = 'the file is empty'
+        return [pscustomobject]$report
+    }
+
+    try {
+        $config = $raw | ConvertFrom-Json -Depth 25
+    } catch {
+        # Fall back to the tolerant reader before giving up - a // comment is a style choice,
+        # not a reason to block a deployment
+        try {
+            $options = [JsonDocumentOptions]::new()
+            $options.CommentHandling = [JsonCommentHandling]::Skip
+            $options.AllowTrailingCommas = $true
+            $document = [JsonDocument]::Parse($raw, $options)
+            try {
+                $config = [JsonSerializer]::Serialize($document.RootElement, [JsonSerializerOptions]::new()) |
+                    ConvertFrom-Json -Depth 25
+            } finally {
+                $document.Dispose()
+            }
+        } catch {
+            $report.ParseError = $_.Exception.Message
+            return [pscustomobject]$report
+        }
+    }
+
+    $report.IsValidJson = $true
+
+    # -Default @() matters: @($null) is a one-element array, which would report a config with
+    # no routes at all as having one
+    $routes = @(Get-SwaProperty -InputObject $config -Name 'routes' -Default @())
+    $report.RouteCount = $routes.Count
+    $report.HasRoutes = $routes.Count -gt 0
+
+    # anonymous and authenticated are platform built-ins; only custom roles get provisioned,
+    # and only anonymous leaves a route open
+    $builtIn = @('anonymous', 'authenticated')
+    $roles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $protected = 0
+
+    foreach ($route in $routes) {
+        $allowed = @(Get-SwaProperty -InputObject $route -Name 'allowedRoles' -Default @()) | Where-Object { $_ }
+        if (@($allowed | Where-Object { $_ -ne 'anonymous' }).Count -gt 0) { $protected++ }
+        foreach ($role in $allowed) {
+            if ($role -notin $builtIn) { $null = $roles.Add($role) }
+        }
+    }
+
+    $report.ProtectedRouteCount = $protected
+    $report.Roles = @($roles | Sort-Object)
+
+    $fallback = Get-SwaProperty -InputObject $config -Name 'navigationFallback'
+    if ($fallback) {
+        $rewrite = Get-SwaProperty -InputObject $fallback -Name 'rewrite'
+        $report.NavigationFallback = if ($rewrite) { $rewrite } else { '(configured)' }
+    }
+
+    return [pscustomobject]$report
+}
+
 function Get-SwaRemoteZip {
     <#
     .SYNOPSIS
@@ -327,7 +638,11 @@ function Get-SwaRemoteZip {
     param(
         [Parameter(Mandatory)][string]$ZipUrl,
         [Parameter(Mandatory)][string]$Destination,
-        [long]$MaxBytes = 1GB
+        [long]$MaxBytes = 1GB,
+
+        # The .NET default of 100s covers the body as well as the headers, so a large artifact
+        # on an ordinary runner link is cancelled mid-stream with nothing to explain it
+        [int]$TimeoutSeconds = 1800
     )
 
     $uri = $null
@@ -345,6 +660,7 @@ function Get-SwaRemoteZip {
     Write-Verbose "[SWA] Downloading $safeUrl"
 
     $http = [HttpClient]::new()
+    $http.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     try {
         $response = $http.GetAsync($uri, [HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
@@ -452,11 +768,18 @@ function New-SwaPayload {
 
         if ($ConfigFilePath) { Add-SwaConfigFile -ZipPath $zipPath -ConfigFilePath $ConfigFilePath }
 
-        # Measure the finished payload (directory entries have an empty Name)
+        # Measure the finished payload (directory entries have an empty Name). Reading the zip
+        # rather than the source tree makes this the one place that knows what is really being
+        # deployed, whichever way the payload was assembled.
         $fileCount = 0
         $totalBytes = [long]0
         $maxFileBytes = [long]0
         $hasConfig = $false
+        $configReport = $null
+        $gitFiles = 0
+        $nodeModulesFiles = 0
+        $workflowFiles = 0
+        $envFiles = [System.Collections.Generic.List[string]]::new()
 
         $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
         try {
@@ -465,7 +788,33 @@ function New-SwaPayload {
                 $fileCount++
                 $totalBytes += $entry.Length
                 if ($entry.Length -gt $maxFileBytes) { $maxFileBytes = $entry.Length }
-                if ($entry.FullName -eq 'staticwebapp.config.json') { $hasConfig = $true }
+
+                if ($entry.FullName -eq 'staticwebapp.config.json') {
+                    $hasConfig = $true
+                    # A downloaded zip reaches here without ever being inflated, so its
+                    # declared size is checked before extracting - the config is a routing
+                    # file, and anything claiming to be larger than this is not one
+                    if ($entry.Length -gt $script:MaxConfigFileBytes) {
+                        $configReport = [pscustomobject]@{
+                            Path = $null; IsValidJson = $false; HasRoutes = $false
+                            RouteCount = 0; ProtectedRouteCount = 0; Roles = @(); NavigationFallback = $null
+                            ParseError = ("it declares $([math]::Round($entry.Length / 1MB, 1)) MB, over the " +
+                                "$([math]::Round($script:MaxConfigFileBytes / 1MB, 1)) MB limit for a config file")
+                        }
+                    } else {
+                        # Extract while the archive is open - entries are invalid once it closes
+                        $extracted = Join-Path $workDir 'staticwebapp.config.json'
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $extracted, $true)
+                        $configReport = Get-SwaConfigReport -ConfigFilePath $extracted
+                    }
+                }
+
+                # Everything under the content root ships and is served publicly, so anything
+                # that is plainly not web content is worth naming before it is uploaded
+                if ($entry.FullName -like '.git/*') { $gitFiles++ }
+                elseif ($entry.FullName -like '.github/*') { $workflowFiles++ }
+                if ($entry.FullName -match '(^|/)node_modules/') { $nodeModulesFiles++ }
+                if ($entry.Name -match '^\.env($|\.)') { $envFiles.Add($entry.FullName) }
             }
         } finally {
             $archive.Dispose()
@@ -473,14 +822,33 @@ function New-SwaPayload {
 
         if ($fileCount -eq 0) { throw "No files to deploy - '$Path' produced an empty payload." }
 
+        $warnings = [System.Collections.Generic.List[string]]::new()
+        $countFiles = { param([int]$N) "$N file$(if ($N -ne 1) { 's' })" }
+        if ($gitFiles -gt 0) {
+            $warnings.Add("the payload contains .git ($(& $countFiles $gitFiles)) - repository history would be served publicly. Point output_location at the build folder.")
+        }
+        if ($nodeModulesFiles -gt 0) {
+            $warnings.Add("the payload contains node_modules ($(& $countFiles $nodeModulesFiles)) - this counts against the 15,000 file quota. Point output_location at the build folder.")
+        }
+        if ($workflowFiles -gt 0) {
+            $warnings.Add("the payload contains .github ($(& $countFiles $workflowFiles)) - workflow definitions would be served publicly.")
+        }
+        foreach ($envFile in $envFiles) {
+            $warnings.Add("the payload contains '$envFile' - environment files are served publicly and often hold secrets.")
+        }
+
         return [pscustomobject]@{
-            ZipPath          = $zipPath
-            WorkDirectory    = $workDir
-            FileCount        = $fileCount
-            TotalBytes       = $totalBytes
-            MaxFileBytes     = $maxFileBytes
-            CompressedBytes  = (Get-Item -LiteralPath $zipPath).Length
-            HasConfigFile    = $hasConfig
+            ZipPath         = $zipPath
+            WorkDirectory   = $workDir
+            FileCount       = $fileCount
+            TotalBytes      = $totalBytes
+            MaxFileBytes    = $maxFileBytes
+            CompressedBytes = (Get-Item -LiteralPath $zipPath).Length
+            HasConfigFile   = $hasConfig
+            ConfigReport    = $configReport
+            # No unary comma: a hashtable value is not unrolled, and ', @()' would wrap the
+            # empty array in a one-element array that iterates once with nothing in it
+            Warnings        = $warnings.ToArray()
         }
     } catch {
         Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -668,6 +1036,127 @@ function Test-SwaQuota {
     return , $violations.ToArray()
 }
 
+function New-SwaDeploymentResult {
+    <#
+    .SYNOPSIS
+        Builds the result object every Invoke-SwaDeployment exit path returns.
+    .DESCRIPTION
+        Declaring the shape once is not tidiness. Callers run under
+        Set-StrictMode -Version Latest, where a property missing from one branch is a
+        terminating error on that branch only - invisible to the linter and to every test
+        that happens to take a different path.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Assembles and returns an object; changes no state.')]
+    param(
+        [Parameter(Mandatory)][string]$Status,
+        [bool]$Success = $false,
+        [string]$SiteUrl,
+        # Not -Error: that would shadow the automatic variable
+        [string]$ErrorText,
+        [string]$ErrorResponse,
+        $Payload,
+        [string]$EnvironmentName = '',
+        [string]$ContentHost = '',
+        [string]$Correlation = '',
+        [string[]]$QuotaViolations = @(),
+        [double]$PackageSeconds = 0,
+        [double]$UploadSeconds = 0,
+        [double]$PollSeconds = 0,
+        [int]$DurationSeconds = 0
+    )
+
+    return [pscustomobject]@{
+        Success         = $Success
+        Status          = $Status
+        SiteUrl         = $(if ($SiteUrl) { $SiteUrl } else { $null })
+        Error           = $(if ($ErrorText) { $ErrorText } else { $null })
+        ErrorResponse   = $(if ($ErrorResponse) { $ErrorResponse } else { $null })
+        FileCount       = (Get-SwaProperty -InputObject $Payload -Name 'FileCount' -Default 0)
+        AppSizeBytes    = (Get-SwaProperty -InputObject $Payload -Name 'TotalBytes' -Default 0)
+        CompressedBytes = (Get-SwaProperty -InputObject $Payload -Name 'CompressedBytes' -Default 0)
+        HasConfigFile   = [bool](Get-SwaProperty -InputObject $Payload -Name 'HasConfigFile' -Default $false)
+        ConfigReport    = (Get-SwaProperty -InputObject $Payload -Name 'ConfigReport')
+        PayloadWarnings = @(Get-SwaProperty -InputObject $Payload -Name 'Warnings' -Default @())
+        EnvironmentName = $EnvironmentName
+        DurationSeconds = $DurationSeconds
+        PackageSeconds  = [math]::Round($PackageSeconds, 1)
+        UploadSeconds   = [math]::Round($UploadSeconds, 1)
+        PollSeconds     = [math]::Round($PollSeconds, 1)
+        ContentHost     = $ContentHost
+        Correlation     = $Correlation
+        QuotaViolations = $QuotaViolations
+    }
+}
+
+function Read-SwaUploadTicket {
+    <#
+    .SYNOPSIS
+        Pulls the SAS URL and polling handle out of an upload/request response.
+    .DESCRIPTION
+        Reading these through Get-SwaProperty rather than an optimistic chain is what lets the
+        'no SAS URL' message actually fire. Under StrictMode the chain throws
+        PropertyNotFoundException first, so a changed API shape used to surface as a
+        PowerShell internal instead of as the guard written for it.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param($UploadRequest)
+
+    $response = Get-SwaProperty -InputObject $UploadRequest -Name 'response'
+    if ($null -eq $response) {
+        throw 'Upload request returned no response body. The content distribution API may have changed.'
+    }
+
+    $packageUris = Get-SwaProperty -InputObject $response -Name 'packageUris'
+    $sasUrl = Get-SwaProperty -InputObject $packageUris -Name 'app' -Default ''
+    if ([string]::IsNullOrWhiteSpace($sasUrl)) {
+        throw 'Upload request did not return a SAS URL for app.zip.'
+    }
+
+    $polling = Get-SwaProperty -InputObject $response -Name 'pollingInfo'
+    return [pscustomobject]@{
+        SasUrl              = $sasUrl
+        DefaultHostname     = (Get-SwaProperty -InputObject $polling -Name 'defaultHostname' -Default '')
+        StageSiteIdentifier = (Get-SwaProperty -InputObject $polling -Name 'stageSiteIdentifier' -Default '')
+        Version             = (Get-SwaProperty -InputObject $polling -Name 'version' -Default '')
+        TenantId            = (Get-SwaProperty -InputObject $polling -Name 'tenantId' -Default '')
+    }
+}
+
+function Read-SwaDeploymentStatus {
+    <#
+    .SYNOPSIS
+        Interprets a checkstatus response into a terminal verdict and a usable site URL.
+    .DESCRIPTION
+        siteUrl comes back empty on deployments that succeeded perfectly well, which used to
+        leave the action green with no URL to show for it. The default hostname from the
+        upload ticket names the same site and is already in hand, so it stands in.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        $Status,
+        [string]$DefaultHostname = ''
+    )
+
+    $response = Get-SwaProperty -InputObject $Status -Name 'response'
+    $deploymentStatus = Get-SwaProperty -InputObject $response -Name 'deploymentStatus' -Default ''
+
+    $siteUrl = "$(Get-SwaProperty -InputObject $response -Name 'siteUrl' -Default '')".Trim()
+    if (-not $siteUrl) { $siteUrl = "$DefaultHostname".Trim() }
+    if ($siteUrl -and $siteUrl -notmatch '^https?://') { $siteUrl = "https://$siteUrl" }
+
+    return [pscustomobject]@{
+        DeploymentStatus = $deploymentStatus
+        IsTerminal       = $deploymentStatus -in @('Succeeded', 'Failed', 'Canceled')
+        Success          = $deploymentStatus -eq 'Succeeded'
+        SiteUrl          = $siteUrl
+    }
+}
+
 function Invoke-SwaDeployment {
     <#
     .SYNOPSIS
@@ -686,6 +1175,8 @@ function Invoke-SwaDeployment {
     #>
     [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Path')]
     [OutputType([pscustomobject])]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+        Justification = 'Read inside the request scriptblocks, which the analyzer does not follow.')]
     param(
         [Parameter(Mandatory)]
         [string]$DeploymentToken,
@@ -715,15 +1206,30 @@ function Invoke-SwaDeployment {
 
         [int]$PollIntervalSeconds = 2,
         [int]$MaxPollAttempts = 120,
+
+        # A status call that fails is a lost look at the deployment, not a failed deployment.
+        # Only this many consecutive failures means we have genuinely lost the thread.
+        [int]$MaxPollErrors = 5,
+
         [int]$MaxFileCount = $script:DefaultMaxFileCount,
-        [long]$MaxAppSizeBytes = $script:DefaultMaxAppSizeBytes
+        [long]$MaxAppSizeBytes = $script:DefaultMaxAppSizeBytes,
+
+        # Refuse to deploy when staticwebapp.config.json is missing from the payload root:
+        # without it Azure applies platform defaults and every route is served anonymously
+        [ValidateSet('off', 'warn', 'error')]
+        [string]$RequireConfigFile = 'off',
+
+        [int]$RequestTimeoutSeconds = 100,
+        [int]$UploadTimeoutSeconds = 1800,
+        [int]$MaxAttempts = 4
     )
 
     $tokenInfo = Resolve-SwaContentHost -DeploymentToken $DeploymentToken
     $swaHost = "https://$($tokenInfo.ContentHost)"
     $apiVersion = 'v1'
     $correlationId = ([guid]::NewGuid()).ToString()
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $totalWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $uploadSeconds = 0.0
 
     $payloadParams = @{
         ZipSubdirectory = $ZipSubdirectory
@@ -737,39 +1243,78 @@ function Invoke-SwaDeployment {
         $payloadParams.Path = $Path
     }
 
+    # Covers the zip_url download too - it is part of getting to a payload, not a phase of its own
+    $packageWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $payload = New-SwaPayload @payloadParams
+    $packageWatch.Stop()
+    $packageSeconds = $packageWatch.Elapsed.TotalSeconds
+
     $quotaViolations = Test-SwaQuota -Payload $payload -MaxFileCount $MaxFileCount -MaxAppSizeBytes $MaxAppSizeBytes
+
+    # Nothing below opens the try/finally that owns the work directory, so every early exit
+    # from here to the HttpClient has to remove it by hand or the runner keeps the zip
+    $discardPayload = {
+        Remove-Item -LiteralPath $payload.WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     Write-Verbose ("[SWA] Payload: {0} files, {1} MB uncompressed ({2} MB zipped), largest file {3} MB" -f
         $payload.FileCount,
         [math]::Round($payload.TotalBytes / 1MB, 1),
         [math]::Round($payload.CompressedBytes / 1MB, 1),
         [math]::Round($payload.MaxFileBytes / 1MB, 1))
-    if (-not $payload.HasConfigFile) {
-        Write-Verbose '[SWA] No staticwebapp.config.json at payload root; platform defaults apply'
-    }
     foreach ($violation in $quotaViolations) {
         Write-Warning "[SWA] Quota exceeded: $violation"
     }
+    foreach ($warning in $payload.Warnings) {
+        Write-Warning "[SWA] $warning"
+    }
+
+    # ---- config gate: the last point before anything is uploaded ----
+    $configProblem = $null
+    if (-not $payload.HasConfigFile) {
+        $configProblem = 'staticwebapp.config.json is not at the payload root'
+    } elseif ($payload.ConfigReport -and -not $payload.ConfigReport.IsValidJson) {
+        $configProblem = "staticwebapp.config.json could not be parsed ($($payload.ConfigReport.ParseError))"
+    }
+
+    if ($configProblem) {
+        $consequence = 'Azure applies platform defaults, so routes and allowedRoles are not enforced ' +
+        'and every path is served anonymously.'
+        if ($RequireConfigFile -eq 'error') {
+            & $discardPayload
+            throw "$configProblem, and require_config_file is 'error'. Nothing was uploaded. $consequence"
+        }
+        if ($RequireConfigFile -eq 'warn') {
+            Write-Warning "[SWA] $configProblem. $consequence"
+        } else {
+            Write-Verbose "[SWA] $configProblem; platform defaults apply"
+        }
+    } elseif ($payload.ConfigReport) {
+        Write-Verbose ("[SWA] Config: {0} routes, {1} role-protected, roles [{2}]" -f
+            $payload.ConfigReport.RouteCount,
+            $payload.ConfigReport.ProtectedRouteCount,
+            ($payload.ConfigReport.Roles -join ', '))
+    }
+
+    $resultDefaults = @{
+        Payload         = $payload
+        EnvironmentName = $EnvironmentName
+        ContentHost     = $tokenInfo.ContentHost
+        Correlation     = $correlationId
+        QuotaViolations = $quotaViolations
+        PackageSeconds  = $packageSeconds
+    }
 
     if (-not $PSCmdlet.ShouldProcess($tokenInfo.ContentHost, "Deploy $($payload.FileCount) files")) {
-        Remove-Item -LiteralPath $payload.WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
-        # Same shape as a real result so callers never hit a missing property under StrictMode
-        return [pscustomobject]@{
-            Success         = $true
-            Status          = 'WhatIf'
-            SiteUrl         = $null
-            FileCount       = $payload.FileCount
-            AppSizeBytes    = $payload.TotalBytes
-            DurationSeconds = 0
-            ContentHost     = $tokenInfo.ContentHost
-            Correlation     = $correlationId
-            QuotaViolations = $quotaViolations
-        }
+        & $discardPayload
+        return New-SwaDeploymentResult -Status 'WhatIf' -Success $true @resultDefaults
     }
 
     $http = [HttpClient]::new()
-    $zipStream = $null
+    # Per-call budgets instead of one client-wide deadline: the .NET default of 100s covers
+    # the whole operation including the request body, which a large blob upload blows through
+    # as an opaque TaskCanceledException that names neither the request nor the cause
+    $http.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
 
     # Correlate every request the way the official client does
     $buildUrl = {
@@ -781,17 +1326,30 @@ function Invoke-SwaDeployment {
     }
 
     $sendJson = {
-        param([string]$Url, [object]$BodyObject, [ref]$RawContent)
+        param(
+            [string]$Url,
+            [object]$BodyObject,
+            [ref]$RawContent,
+            [int]$Attempts = $MaxAttempts,
+            [int[]]$RetryStatuses = @(408, 429, 500, 502, 503, 504)
+        )
 
         $json = [JsonSerializer]::Serialize($BodyObject, [JsonSerializerOptions]::new())
         $uri = [System.Uri]::new($Url)
         Write-Verbose "[SWA] POST $($uri.AbsolutePath)"
 
-        $request = [HttpRequestMessage]::new([HttpMethod]::Post, $uri)
-        $null = $request.Headers.TryAddWithoutValidation('Authorization', "token $DeploymentToken")
-        $request.Content = [StringContent]::new($json, [Encoding]::UTF8, 'application/json')
+        # A fresh message per attempt: HttpRequestMessage cannot be sent twice. The token
+        # header goes on the request, never on the client - the client also sends the blob
+        # PUT, and that SAS URL belongs to a storage account that must not see the token.
+        $response = Invoke-SwaHttpRequest -Client $http -Operation "POST $($uri.AbsolutePath)" `
+            -TimeoutSeconds $RequestTimeoutSeconds -MaxAttempts $Attempts `
+            -RetryStatusCodes $RetryStatuses -RequestFactory {
+            $request = [HttpRequestMessage]::new([HttpMethod]::Post, $uri)
+            $null = $request.Headers.TryAddWithoutValidation('Authorization', "token $DeploymentToken")
+            $request.Content = [StringContent]::new($json, [Encoding]::UTF8, 'application/json')
+            return $request
+        }
 
-        $response = $http.SendAsync($request).GetAwaiter().GetResult()
         $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if ($RawContent) { $RawContent.Value = $content }
 
@@ -812,7 +1370,7 @@ function Invoke-SwaDeployment {
         # Quota and config rejections come back as HTTP 200 wrapping a failure envelope, so
         # the envelope has to be checked on every call or the real reason is lost and the
         # deployment only fails later with 'Failure during content distribution.'
-        if ($parsed.PSObject.Properties.Name -contains 'isSuccessStatusCode' -and $parsed.isSuccessStatusCode -eq $false) {
+        if ((Get-SwaProperty -InputObject $parsed -Name 'isSuccessStatusCode') -eq $false) {
             $reason = ConvertTo-SwaErrorText -ErrorObject $parsed
             if (-not $reason) { $reason = $content }
             throw "The content server rejected $($uri.AbsolutePath) with $($parsed.statusCode). Reason: $reason"
@@ -839,9 +1397,9 @@ function Invoke-SwaDeployment {
         # 1) validate the deployment token
         Write-Verbose "[SWA] Validating token (slice $($tokenInfo.Slice), region $($tokenInfo.RegionId), host $($tokenInfo.ContentHost))"
         $validation = & $sendJson (& $buildUrl '/api/upload/validateapitoken') $eventInfo $null
-        if ($validation -and $validation.PSObject.Properties.Name -contains 'statusCode' -and
-            $validation.statusCode -and $validation.statusCode -ne 200) {
-            throw "Token validation returned unexpected status: $($validation.statusCode)"
+        $validationStatus = Get-SwaProperty -InputObject $validation -Name 'statusCode'
+        if ($validationStatus -and $validationStatus -ne 200) {
+            throw "Token validation returned unexpected status: $validationStatus"
         }
 
         # 2) request an upload slot - the server validates quotas against these numbers
@@ -852,11 +1410,14 @@ function Invoke-SwaDeployment {
             HasDataApiFiles           = $false
             HasDataApiConfigFile      = $false
             DatabaseType              = ''
-            HasRoutes                 = $false
+            # Reported from the config we packaged rather than assumed away: Azure provisions
+            # the roles it is told about, and understating them is how a route that should
+            # ask for a login ends up open
+            HasRoutes                 = [bool](Get-SwaProperty -InputObject $payload.ConfigReport -Name 'HasRoutes' -Default $false)
             Status                    = 'RequestingUpload'
             DefaultFileType           = 'index.html'
             ApiContentHash            = $null
-            ConfiguredRoles           = @()
+            ConfiguredRoles           = @(Get-SwaProperty -InputObject $payload.ConfigReport -Name 'Roles' -Default @())
             AppFileCount              = $payload.FileCount
             FunctionLanguage          = $null
             FunctionLanguageVersion   = $null
@@ -870,28 +1431,37 @@ function Invoke-SwaDeployment {
             Slice                     = $tokenInfo.Slice
         }
 
+        # This one allocates an upload slot, so it is retried only on throttling and refusals
+        # the server never acted on. A 502 from a gateway could mean the slot was allocated
+        # and the answer lost on the way back.
         $uploadRequest = & $sendJson (& $buildUrl '/api/upload/request') @{
             EventInfo   = $eventInfo
             UploadInfo  = $uploadInfo
             PollingInfo = $null
-        } $null
+        } $null $MaxAttempts @(429, 503)
 
-        $sasUrl = $uploadRequest.response.packageUris.app
-        $polling = $uploadRequest.response.pollingInfo
-        if ([string]::IsNullOrWhiteSpace($sasUrl)) { throw 'Upload request did not return a SAS URL for app.zip.' }
+        $ticket = Read-SwaUploadTicket -UploadRequest $uploadRequest
 
         # 3) upload the zip to blob storage
         Write-Verbose "[SWA] Uploading $([math]::Round($payload.CompressedBytes / 1MB, 1)) MB"
-        $zipStream = [System.IO.File]::OpenRead($payload.ZipPath)
-        $blobRequest = [HttpRequestMessage]::new([HttpMethod]::Put, $sasUrl)
-        $null = $blobRequest.Headers.TryAddWithoutValidation('x-ms-blob-type', 'BlockBlob')
-        $null = $blobRequest.Headers.TryAddWithoutValidation('x-ms-version', '2023-11-03')
-        $blobContent = [StreamContent]::new($zipStream)
-        $blobContent.Headers.ContentType = [MediaTypeHeaderValue]::Parse('application/octet-stream')
-        $blobContent.Headers.ContentLength = $payload.CompressedBytes
-        $blobRequest.Content = $blobContent
+        $uploadWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $blobResponse = Invoke-SwaHttpRequest -Client $http -Operation 'Uploading app.zip' `
+            -TimeoutSeconds $UploadTimeoutSeconds -MaxAttempts $MaxAttempts `
+            -CompletionOption ([HttpCompletionOption]::ResponseHeadersRead) -RequestFactory {
+            # Re-opened per attempt: a retry has to start the body at offset zero, and the
+            # previous attempt's stream was disposed along with its request
+            $blobRequest = [HttpRequestMessage]::new([HttpMethod]::Put, $ticket.SasUrl)
+            $null = $blobRequest.Headers.TryAddWithoutValidation('x-ms-blob-type', 'BlockBlob')
+            $null = $blobRequest.Headers.TryAddWithoutValidation('x-ms-version', '2023-11-03')
+            $blobContent = [StreamContent]::new([System.IO.File]::OpenRead($payload.ZipPath))
+            $blobContent.Headers.ContentType = [MediaTypeHeaderValue]::Parse('application/octet-stream')
+            $blobContent.Headers.ContentLength = $payload.CompressedBytes
+            $blobRequest.Content = $blobContent
+            return $blobRequest
+        }
+        $uploadWatch.Stop()
+        $uploadSeconds = $uploadWatch.Elapsed.TotalSeconds
 
-        $blobResponse = $http.SendAsync($blobRequest, [HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         if (-not $blobResponse.IsSuccessStatusCode) {
             $blobError = $blobResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
             throw "Uploading app.zip failed with $($blobResponse.StatusCode): $blobError"
@@ -900,10 +1470,10 @@ function Invoke-SwaDeployment {
         # 4) tell the server the upload finished
         $uploadInfo.Status = 'Succeeded'
         $pollingInfo = [ordered]@{
-            DefaultHostname     = $polling.defaultHostname
-            StageSiteIdentifier = $polling.stageSiteIdentifier
-            Version             = $polling.version
-            TenantId            = ($polling.tenantId ?? '')
+            DefaultHostname     = $ticket.DefaultHostname
+            StageSiteIdentifier = $ticket.StageSiteIdentifier
+            Version             = $ticket.Version
+            TenantId            = $ticket.TenantId
             Slice               = $tokenInfo.Slice
             GitHubRepoUrl       = $RepositoryUrl
         }
@@ -917,67 +1487,77 @@ function Invoke-SwaDeployment {
         # 5) poll until the content is distributed
         $statusUrl = & $buildUrl '/api/upload/checkstatus'
         $rawStatus = $null
+        $pollWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $consecutiveErrors = 0
+
         for ($attempt = 0; $attempt -lt $MaxPollAttempts; $attempt++) {
             Start-Sleep -Seconds $PollIntervalSeconds
-            $status = & $sendJson $statusUrl $pollingInfo ([ref]$rawStatus)
-            $deploymentStatus = $status.response.deploymentStatus
-            Write-Verbose "[SWA] deploymentStatus=$deploymentStatus"
 
-            if ($deploymentStatus -eq 'Succeeded') {
-                $stopwatch.Stop()
-                return [pscustomobject]@{
-                    Success         = $true
-                    Status          = $deploymentStatus
-                    SiteUrl         = $status.response.siteUrl
-                    FileCount       = $payload.FileCount
-                    AppSizeBytes    = $payload.TotalBytes
-                    DurationSeconds = [int]$stopwatch.Elapsed.TotalSeconds
-                    ContentHost     = $tokenInfo.ContentHost
-                    Correlation     = $correlationId
-                    QuotaViolations = $quotaViolations
+            try {
+                # One attempt per poll: the loop itself is the retry, and burning four
+                # attempts here would stretch a two-second interval into half a minute
+                $status = & $sendJson $statusUrl $pollingInfo ([ref]$rawStatus) 1
+                $consecutiveErrors = 0
+            } catch {
+                # The content is still being distributed whether or not we can see it, so a
+                # failed status check is a lost look rather than a failed deployment
+                $consecutiveErrors++
+                Write-Warning "[SWA] Status check failed ($consecutiveErrors/$MaxPollErrors): $($_.Exception.Message)"
+                if ($consecutiveErrors -ge $MaxPollErrors) {
+                    $pollWatch.Stop()
+                    $totalWatch.Stop()
+                    return New-SwaDeploymentResult -Status 'Unknown' @resultDefaults `
+                        -UploadSeconds $uploadSeconds -PollSeconds $pollWatch.Elapsed.TotalSeconds `
+                        -DurationSeconds ([int]$totalWatch.Elapsed.TotalSeconds) -ErrorResponse $rawStatus `
+                        -ErrorText ("Lost contact with the content server after $MaxPollErrors consecutive " +
+                        "status checks: $($_.Exception.Message). The deployment may still complete - " +
+                        "check the Azure portal (correlation $correlationId).")
                 }
+                continue
             }
 
-            if ($deploymentStatus -in @('Failed', 'Canceled')) {
-                $stopwatch.Stop()
-                $errorText = Get-SwaStatusError -Status $status -DeploymentStatus $deploymentStatus
-                # Azure never names the quota that was hit, so attach what we measured
-                if ($quotaViolations.Count -gt 0) {
-                    $errorText = "$errorText | Likely cause: $($quotaViolations -join '; ')"
-                }
-                Write-Verbose "[SWA] Failure response: $rawStatus"
-                return [pscustomobject]@{
-                    Success         = $false
-                    Status          = $deploymentStatus
-                    Error           = $errorText
-                    ErrorResponse   = $rawStatus
-                    FileCount       = $payload.FileCount
-                    AppSizeBytes    = $payload.TotalBytes
-                    DurationSeconds = [int]$stopwatch.Elapsed.TotalSeconds
-                    ContentHost     = $tokenInfo.ContentHost
-                    Correlation     = $correlationId
-                    QuotaViolations = $quotaViolations
-                }
+            # No fallback hostname for a named environment: the ticket's defaultHostname is
+            # the production site, and reporting that as the preview URL would be worse than
+            # reporting none at all
+            $fallbackHostname = if ($EnvironmentName) { '' } else { $ticket.DefaultHostname }
+            $verdict = Read-SwaDeploymentStatus -Status $status -DefaultHostname $fallbackHostname
+            Write-Verbose "[SWA] deploymentStatus=$($verdict.DeploymentStatus)"
+            if (-not $verdict.IsTerminal) { continue }
+
+            $pollWatch.Stop()
+            $totalWatch.Stop()
+            $pollSeconds = $pollWatch.Elapsed.TotalSeconds
+            $phases = @{
+                UploadSeconds   = $uploadSeconds
+                PollSeconds     = $pollSeconds
+                DurationSeconds = [int]$totalWatch.Elapsed.TotalSeconds
             }
+
+            if ($verdict.Success) {
+                return New-SwaDeploymentResult -Status $verdict.DeploymentStatus -Success $true `
+                    -SiteUrl $verdict.SiteUrl @resultDefaults @phases
+            }
+
+            $errorText = Get-SwaStatusError -Status $status -DeploymentStatus $verdict.DeploymentStatus
+            # Azure never names the quota that was hit, so attach what we measured
+            if ($quotaViolations.Count -gt 0) {
+                $errorText = "$errorText | Likely cause: $($quotaViolations -join '; ')"
+            }
+            Write-Verbose "[SWA] Failure response: $rawStatus"
+            return New-SwaDeploymentResult -Status $verdict.DeploymentStatus -ErrorText $errorText `
+                -ErrorResponse $rawStatus @resultDefaults @phases
         }
 
-        $stopwatch.Stop()
-        return [pscustomobject]@{
-            Success         = $false
-            Status          = 'TimedOut'
-            Error           = "Timed out after $($MaxPollAttempts * $PollIntervalSeconds)s waiting for deployment."
-            ErrorResponse   = $rawStatus
-            FileCount       = $payload.FileCount
-            AppSizeBytes    = $payload.TotalBytes
-            DurationSeconds = [int]$stopwatch.Elapsed.TotalSeconds
-            ContentHost     = $tokenInfo.ContentHost
-            Correlation     = $correlationId
-            QuotaViolations = $quotaViolations
-        }
+        $pollWatch.Stop()
+        $totalWatch.Stop()
+        return New-SwaDeploymentResult -Status 'TimedOut' @resultDefaults `
+            -UploadSeconds $uploadSeconds -PollSeconds $pollWatch.Elapsed.TotalSeconds `
+            -DurationSeconds ([int]$totalWatch.Elapsed.TotalSeconds) -ErrorResponse $rawStatus `
+            -ErrorText ("Stopped waiting after $($MaxPollAttempts * $PollIntervalSeconds)s. Azure had not " +
+            "reported the deployment finished - it may still complete (correlation $correlationId).")
     } finally {
-        if ($zipStream) { $zipStream.Dispose() }
         $http.Dispose()
-        Remove-Item -LiteralPath $payload.WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        & $discardPayload
     }
 }
 

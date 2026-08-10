@@ -2,7 +2,7 @@
 # Copyright 2026 CyberDrain
 @{
     RootModule        = 'SwaDeploy.psm1'
-    NestedModules     = @('SwaBuild.psm1')
+    NestedModules     = @('SwaBuild.psm1', 'SwaAction.psm1')
     ModuleVersion     = '0.1.0'
     GUID              = 'b7c4e2a1-9f36-4d58-8e7a-2c1d5f0a3b64'
     Author            = 'CyberDrain'
@@ -12,14 +12,22 @@
     FunctionsToExport = @(
         'ConvertTo-SwaErrorText',
         'Get-SwaStatusError',
+        'Get-SwaProperty',
+        'Read-SwaUploadTicket',
+        'Read-SwaDeploymentStatus',
+        'New-SwaDeploymentResult',
         'Resolve-SwaContentHost',
         'New-SwaPayload',
         'Get-SwaRemoteZip',
         'Resolve-SwaWorkspacePath',
         'Resolve-SwaConfigFilePath',
         'Copy-SwaConfigFile',
+        'Get-SwaConfigReport',
         'ConvertTo-SwaEnvironmentName',
         'Test-SwaQuota',
+        'Invoke-SwaWithRetry',
+        'Invoke-SwaHttpRequest',
+        'Test-SwaTransientFailure',
         'Invoke-SwaDeployment',
         'Get-SwaBuildPlan',
         'Get-SwaPackageManager',
@@ -32,7 +40,15 @@
         'Get-SwaNodePlatform',
         'Resolve-SwaNodeVersion',
         'Install-SwaNode',
-        'Add-SwaPathEntry'
+        'Add-SwaPathEntry',
+        'Get-ActionInput',
+        'Test-ActionFlag',
+        'Write-ActionOutput',
+        'Write-ActionSummary',
+        'Write-ActionError',
+        'Write-ActionWarning',
+        'Write-ActionNotice',
+        'Format-SwaSummaryTable'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

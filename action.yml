@@ -64,6 +64,10 @@ inputs:
     required: false
 
   # ---- additions ----
+  require_config_file:
+    description: "How to handle a payload with no staticwebapp.config.json at its root, or one that will not parse. 'warn' annotates the run, 'error' refuses to deploy before anything is uploaded, 'off' says nothing. Without the config Azure applies platform defaults, so routes and allowedRoles are not enforced and every path is served anonymously."
+    required: false
+    default: "warn"
   install_node:
     description: "When the runner's Node does not satisfy engines.node, resolve the range against nodejs.org and install a matching release. Set false to warn instead."
     required: false
@@ -83,10 +87,42 @@ inputs:
     required: false
     default: "false"
 
+# Written on the failure paths as well as on success, so a follow-up step can report on a
+# broken deployment. That step needs if: always() to run at all.
 outputs:
   static_web_app_url:
     description: "Url of the deployed application. Set only on a successful deployment."
     value: ${{ steps.deploy.outputs.static_web_app_url }}
+  deployment_status:
+    description: "Succeeded, Failed, Canceled, TimedOut, Unknown (lost contact while Azure was still distributing), or Error (failed before deploying)."
+    value: ${{ steps.deploy.outputs.deployment_status }}
+  deployment_environment:
+    description: "Environment that was deployed to. Empty means production."
+    value: ${{ steps.deploy.outputs.deployment_environment }}
+  file_count:
+    description: "Number of files in the deployed payload."
+    value: ${{ steps.deploy.outputs.file_count }}
+  app_size_bytes:
+    description: "Uncompressed size of the deployed payload, in bytes."
+    value: ${{ steps.deploy.outputs.app_size_bytes }}
+  compressed_size_bytes:
+    description: "Size of the uploaded zip, in bytes."
+    value: ${{ steps.deploy.outputs.compressed_size_bytes }}
+  has_config_file:
+    description: "'true' when staticwebapp.config.json was at the payload root."
+    value: ${{ steps.deploy.outputs.has_config_file }}
+  build_duration_seconds:
+    description: "Seconds spent building. 0 when the build was skipped."
+    value: ${{ steps.deploy.outputs.build_duration_seconds }}
+  deploy_duration_seconds:
+    description: "Seconds spent packaging, uploading and distributing."
+    value: ${{ steps.deploy.outputs.deploy_duration_seconds }}
+  total_duration_seconds:
+    description: "Seconds the action took end to end."
+    value: ${{ steps.deploy.outputs.total_duration_seconds }}
+  correlation_id:
+    description: "Deployment correlation ID. The first thing Azure support asks for."
+    value: ${{ steps.deploy.outputs.correlation_id }}
 
 runs:
   using: composite
@@ -112,6 +148,7 @@ runs:
         INPUT_API_LOCATION: ${{ inputs.api_location }}
         INPUT_DATA_API_LOCATION: ${{ inputs.data_api_location }}
         INPUT_ROUTES_LOCATION: ${{ inputs.routes_location }}
+        INPUT_REQUIRE_CONFIG_FILE: ${{ inputs.require_config_file }}
         INPUT_INSTALL_NODE: ${{ inputs.install_node }}
         INPUT_ZIP_URL: ${{ inputs.zip_url }}
         INPUT_ZIP_SUBDIRECTORY: ${{ inputs.zip_subdirectory }}

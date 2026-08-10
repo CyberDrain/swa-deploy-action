@@ -29,8 +29,18 @@ jobs:
           app_location: "/"
           output_location: "dist"
           production_branch: "main"
+          # Refuse to deploy if staticwebapp.config.json did not make it into the payload.
+          # Without it Azure applies platform defaults, so allowedRoles is not enforced and
+          # routes meant to require a login are served to anyone. Defaults to 'warn'.
+          require_config_file: error
 
-      - run: echo "Deployed to ${{ steps.deploy.outputs.static_web_app_url }}"
+      # if: always() so a failed deployment still gets reported - correlation_id and
+      # deployment_status are written on the failure paths too
+      - if: always()
+        run: |
+          echo "${{ steps.deploy.outputs.deployment_status }} to ${{ steps.deploy.outputs.static_web_app_url }}"
+          echo "${{ steps.deploy.outputs.file_count }} files in ${{ steps.deploy.outputs.total_duration_seconds }}s"
+          echo "correlation ${{ steps.deploy.outputs.correlation_id }}"
 
   close_preview:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
